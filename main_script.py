@@ -2,11 +2,12 @@ from support_functions import *
 import argparse
 import json
 from joblib import delayed,Parallel
+import pandas as pd
 import pickle
 def main():
     parser = argparse.ArgumentParser(description='Find allelic variants and polyA tract lengths', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('-i','--input',metavar='input', type=str, help='Input .bam file')
-    parser.add_argument('-h5','--h5-file', metavar='output', type=str, help='Input hdf5 file')
+    parser.add_argument('--insertions', metavar='output', type=str, help='Input .csv file with insertion information')
     parser.add_argument('-t', '--threads', metavar='threads', type=int, default=1, help='Number of threads')
     parser.add_argument('-s', '--samplesheet', metavar='samplesheet', type=str, help='Samplesheet, needs BCSet column')
     parser.add_argument('-p', '--prefix', metavar='prefix', type=str, help='Output prefix')
@@ -14,29 +15,11 @@ def main():
     args = parser.parse_args()
 
     bamfile = args.input
-    h5_file = args.h5_file
     threads = args.threads
     samplesheet_file = args.samplesheet
     prefix = args.prefix
     
-    f_h5 = h5py.File(h5_file, 'r')
-    insertion_information = {}
-    for chrom, chrom_grp in f_h5.items():
-        for ins, ins_grp in chrom_grp.items():
-            if 'source_length' in ins_grp.attrs.keys():
-                t = 'KR'
-            elif 'source_kind' in ins_grp.attrs.keys():
-                t = 'KNR'
-            else:
-                t = 'UNK'
-            if t in ['KR','KNR']:
-                insertion_information['{}_{}'.format(chrom, ins)] = {}
-                insertion_information['{}_{}'.format(chrom, ins)]['type'] = t
-                insertion_information['{}_{}'.format(chrom, ins)]['chrom'] = ins_grp.attrs['chrom']
-                insertion_information['{}_{}'.format(chrom, ins)]['start'] = ins_grp.attrs['start']
-                insertion_information['{}_{}'.format(chrom, ins)]['source_start'] = ins_grp.attrs['source_start']
-                insertion_information['{}_{}'.format(chrom, ins)]['end'] = ins_grp.attrs['end']
-                insertion_information['{}_{}'.format(chrom, ins)]['strand'] = ins_grp.attrs['strand']
+    insertion_information = pd.read_csv(args.insertions, index_col = 0).T.to_dict()
     samplesheet = pd.read_csv(samplesheet_file, index_col=0)
     samplesheet_DNA = samplesheet[(samplesheet['Modality'] == 'DNA')]
     cell_BC_set = set(samplesheet_DNA.index)
