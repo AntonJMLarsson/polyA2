@@ -2,7 +2,7 @@ import pandas as pd
 import sys
 import pickle
 pickle.HIGHEST_PROTOCOL = 4
-
+## Turn the pickle into a pandas hdf object.
 def main():
     infile = sys.argv[1]
     outfile = sys.argv[2]

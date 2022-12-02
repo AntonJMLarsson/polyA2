@@ -11,6 +11,7 @@ from joblib import delayed,Parallel
 import seaborn as sns
 import matplotlib.pyplot as plt
 
+## used by collect_tag_site_info and get_sequence_pwm
 def summarize_sequence(seq, cutoff):
     pre_string = ''
     A_counter = 0
@@ -30,15 +31,7 @@ def summarize_sequence(seq, cutoff):
     pre_string_list.append(pre_string[:cutoff])
     return pre_string_list
 
-def group_identical_reads(read_dict):
-    identical_reads = {}
-    for cell, seq_list in read_dict.items():
-        for seq in seq_list:
-            if seq in identical_reads.keys():
-                identical_reads[seq] += 1     
-            else:
-                identical_reads[seq] = 1
-    return identical_reads
+
 
 def find_cells_with_sequence(read_dict, seq):
     cell_list = []
@@ -47,28 +40,6 @@ def find_cells_with_sequence(read_dict, seq):
             cell_list.append(cell)
     return cell_list
 
-def group_sequences(identical_reads):
-    sequence_summaries_count = Counter()
-    sequence_summaries = {}
-    for seq,n in identical_reads.items():
-        s = ','.join(summarize_sequence(seq,5))
-        if s in sequence_summaries:
-            sequence_summaries[s].append(seq)
-        else:
-            sequence_summaries[s] = [seq]
-        sequence_summaries_count.update({s:n})
-    return sequence_summaries,sequence_summaries_count
-
-def get_sequence_pwm(seqs, identical_reads):
-    base_freqs = Counter()
-    for seq in seqs:
-        last_sequence = summarize_sequence(seq,1000)[-1]
-        c = Counter(enumerate(last_sequence))
-        n = identical_reads[seq]
-        for k in c.keys():
-            c[k] = n
-        base_freqs.update(c)
-    return base_freqs
 
 def count_A_tracts(seq):
     A_counter = 0
@@ -104,6 +75,7 @@ def reconstruct_bottleneck_sequence(seq, flank_sequence, A_tract_lengths):
     reconstructed_sequence += flank_sequence
     return reconstructed_sequence
 
+## used by collect_tag_site_info, ensure the read is in the correct orientation relative to the insertion (always opposite orientation).
 def correct_orientation(read, strand):
     if (read.is_reverse and strand == '+') or (~read.is_reverse and strand == '-'):
         return True
@@ -129,6 +101,7 @@ def collect_tag_site_numbers(bamfile, cell_BC_set, insertion_dict, key):
     
     return key, tagmentation_sites_counter
 
+## used by get_alleles_by_tagmentation_site, collects the sequence summaries for each tagmentation site within each cell.
 def collect_tag_site_info(bamfile, cell_BC_set, insertion_dict):
     bam = pysam.AlignmentFile(bamfile,'rb')
     tagmentation_site_per_allele = {cell: {} for cell in cell_BC_set}
@@ -157,6 +130,8 @@ def collect_tag_site_info(bamfile, cell_BC_set, insertion_dict):
     
     return tagmentation_site_per_allele_counter
 
+## used by get_alleles_by_tagmentation_site. The main thing this function does is get candidate representations of alleles by taking the most common sequence summary
+## per tagmentation sequence (and cell), if that sequence has a read count above 10.
 def get_correct_alleles(tagmentation_site_per_allele_counter):
     allele_counter = Counter()
     tag_site_distribution_dict = {}
@@ -187,6 +162,7 @@ def get_correct_alleles(tagmentation_site_per_allele_counter):
             cell_w_tag_site += 1
     return allele_counter, tag_site_distribution_dict, count_distribution_dict, cell_w_counts, cell_w_tag_site
 
+## used by get_alleles_by_tagmentation_site, finds the most common sequences in within a tagmentation site (per cell) to find the representative sequence for each allele.
 def get_allele_coupling(tagmentation_site_per_allele_counter, allele_counter):
     allele_count_n = {allele_key: 0 for allele_key in allele_counter.keys()}
     allele_count_k = {allele_key: Counter({allele_key: 0 for allele_key in allele_counter.keys()}) for allele_key in allele_counter.keys()}
@@ -202,6 +178,7 @@ def get_allele_coupling(tagmentation_site_per_allele_counter, allele_counter):
                 for other_key in other_allele_keys:
                     allele_count_k[allele_key].update({other_key: tag_site_dict[other_key]})
     return allele_count_n, allele_count_k
+## used in main
 def get_alleles_by_tagmentation_site(bamfile, cell_BC_set, insertion_dict, key):
     
     tagmentation_site_per_allele_counter = collect_tag_site_info(bamfile, cell_BC_set, insertion_dict)
@@ -215,74 +192,14 @@ def get_alleles_by_tagmentation_site(bamfile, cell_BC_set, insertion_dict, key):
                    'allele_count_k': allele_count_k}
     
     return key, result_dict
+
+## used in main
 def compare_allele_stats(info_dict, allele_key_dict):
     conditional_probs = {a1: {} for a1 in allele_key_dict.keys()}
     for a1, a2 in permutations(allele_key_dict.keys(),2):
         conditional_probs[a1][a2] = info_dict['allele_count_k'][a1][a2]/info_dict['allele_count_k'][a1][a1]
     return conditional_probs
-def get_quality_falloff(bamfile, cell_BC_set, insertion_dict, ins_key):
-    bam = pysam.AlignmentFile(bamfile, 'rb')
-    N = 0
-    qual_mean = {p: 0 for p in range(127)}
-    for read in bam.fetch(insertion_dict['chrom'], insertion_dict['start'], insertion_dict['end']):
-        cell = read.get_tag('BC')
-        if cell in cell_BC_set:
-            if correct_orientation(read, insertion_dict['strand']):
-                
-                qual = read.get_tag('LQ')[23:]
-                qual_list = list(qual)
-                qual_list = [ord(c) - 33 for c in qual_list]
-                for p, q in enumerate(qual_list):
-                    qual_mean[p] = float((qual_mean[p] * N) + q) / (N + 1)
-                N += 1
-    return ins_key, qual_mean
-def get_heterozygous_positions(bamfile, ins_info, key):
-    bam = pysam.AlignmentFile(bamfile, 'rb')
-    ins_res = []
-    for pileupcolumn in bam.pileup(ins_info['chrom'], ins_info['start'], ins_info['end'] ):
-        l = pileupcolumn.get_query_sequences()
-        l = [c.upper() for c in l]
-        if len(l) > 7000:
-            n_bases = Counter(l)
-            fraction_bases = Counter({c:count/sum(n_bases.values()) for c, count in n_bases.items()})
-            most_common_fraction = fraction_bases.most_common()
-            if most_common_fraction[0][1] < 0.6:
-                a1 = most_common_fraction[0][0]
-                a2 = most_common_fraction[1][0]
-                a1_frac = most_common_fraction[0][1]
-                a2_frac = most_common_fraction[1][1]
-                if a1 != '' and a2 != '':
-                    ins_res.append([pileupcolumn.reference_pos, a1, a2, a1_frac, a2_frac])
-    return key, ins_res
 
-def get_quality_falloff(bamfile, cell_BC_set, insertion_dict, ins_key):
-    bam = pysam.AlignmentFile(bamfile, 'rb')
-    N = 0
-    qual_mean = {p: 0 for p in range(127)}
-    for read in bam.fetch(insertion_dict['chrom'], insertion_dict['start'], insertion_dict['end']):
-        cell = read.get_tag('BC')
-        if cell in cell_BC_set:
-            if correct_orientation(read, insertion_dict['strand']):
-                
-                qual = read.get_tag('LQ')[23:]
-                qual_list = list(qual)
-                qual_list = [ord(c) - 33 for c in qual_list]
-                for p, q in enumerate(qual_list):
-                    qual_mean[p] = float((qual_mean[p] * N) + q) / (N + 1)
-                N += 1
-    return ins_key, qual_mean
-def cell_contingency_table(ins_key, ins_dict, insertion_dict, bamfile, cell_BC_set):
-    tagmentation_site_per_allele_counter = collect_tag_site_info(bamfile, cell_BC_set, insertion_dict)
-    cell_detection_per_allele = {allele_key: set() for allele_key in ins_dict.keys()}
-    
-    for cell, tag_site_dicts in tagmentation_site_per_allele_counter.items():
-        for p, tag_site_dict in tag_site_dicts.items():
-            most_common_list = tag_site_dict.most_common()
-            count = most_common_list[0][1]
-            allele_key = most_common_list[0][0]
-            if count > 10 and allele_key in cell_detection_per_allele:
-                cell_detection_per_allele[allele_key] = cell_detection_per_allele[allele_key].union([cell])
-    return cell_detection_per_allele
 def get_operation_list(destination_motif):
     summary_list = destination_motif.split(',')
     n = len(summary_list)
@@ -482,6 +399,42 @@ def determine_next_action(source_motif_list, destination_motif_list, source_flan
             source_operations = get_operation_list(','.join(source_motif_list))[i]
             action = determing_editing_action(source_seq, destination_seq, destination_operations, source_operations, source_flank, destination_flank, i, n)
     return action
+## used by collect_flanking_sequences
+def group_identical_reads(read_dict):
+    identical_reads = {}
+    for cell, seq_list in read_dict.items():
+        for seq in seq_list:
+            if seq in identical_reads.keys():
+                identical_reads[seq] += 1     
+            else:
+                identical_reads[seq] = 1
+    return identical_reads
+
+## used by collect_flanking_sequences
+def group_sequences(identical_reads):
+    sequence_summaries_count = Counter()
+    sequence_summaries = {}
+    for seq,n in identical_reads.items():
+        s = ','.join(summarize_sequence(seq,5))
+        if s in sequence_summaries:
+            sequence_summaries[s].append(seq)
+        else:
+            sequence_summaries[s] = [seq]
+        sequence_summaries_count.update({s:n})
+    return sequence_summaries,sequence_summaries_count
+
+## used by collect_flanking_sequences
+def get_sequence_pwm(seqs, identical_reads):
+    base_freqs = Counter()
+    for seq in seqs:
+        last_sequence = summarize_sequence(seq,1000)[-1]
+        c = Counter(enumerate(last_sequence))
+        n = identical_reads[seq]
+        for k in c.keys():
+            c[k] = n
+        base_freqs.update(c)
+    return base_freqs
+## used by find_transformations
 def collect_flanking_sequences(bamfile, cell_BC_set, insertion_dict, allele_list):
     bam = pysam.AlignmentFile(bamfile, 'r')
 
@@ -509,12 +462,14 @@ def collect_flanking_sequences(bamfile, cell_BC_set, insertion_dict, allele_list
         cpm = seqlogo.CompletePm(pfm)
         cpm_dict[allele_key] = cpm
     return cpm_dict
+
+## skipped for now in main
 def find_transformations(bamfile, cell_BC_set, insertion_dict, allele_call, key):
+    ## Find out how the tract is flanked.
     cpm_dict = collect_flanking_sequences(bamfile, cell_BC_set, insertion_dict, allele_call)
     flanking_dict = {allele_key: cpm.consensus for allele_key, cpm in cpm_dict.items()}
     operations_dict = {k: {} for k in flanking_dict.keys()}
     for k1, k2 in permutations(flanking_dict, 2):
-        
         operations_dict[k1][k2] = calculate_minimum_operations(k1, flanking_dict[k1], k2, flanking_dict[k2])
     return key, operations_dict
 def find_transformation_errors_per_allele(bamfile, cell_BC_set, insertion_dict, noise_dict, key):
@@ -531,6 +486,7 @@ def find_transformation_errors(bamfile, cell_BC_set, insertion_dict, origin_alle
     for k1 in noise_alleles:
         operations_dict[k1][origin_allele] = calculate_minimum_operations(k1, flanking_dict[k1], origin_allele, flanking_dict[origin_allele])
     return key, operations_dict
+## used in main, tries to figure out how to edit a sequence summary (and the resulting tract lengths) to obtain the correct histogram.
 def corrrection_to_apply(action_list, destination_allele):
     correction_dict = {i: 0 for i in range(destination_allele.count(','))}
     abort_set = set(['insert', 'abort', 'infinite', 'remove'])
@@ -551,7 +507,6 @@ def corrrection_to_apply(action_list, destination_allele):
             if action[1] == len(correction_dict):
                 continue
             correction_dict[action[1]] -= len(action[3])
-            
     return correction_dict
 def get_heterozygous_positions(bamfile, ins_info, key):
     bam = pysam.AlignmentFile(bamfile, 'rb')
@@ -1063,11 +1018,7 @@ def get_final_stats_to_write(test, ins_key, insertion_dict):
     
     conservative_fun = make_determine_function(original_alleles)
     final_stats = find_most_likely_length(tract_stats, conservative_fun)
-    
-    
-    
 
-    
     cell_detection_stats = {i: set() for i in range(n_alleles)}
     
     final_stats_unique_key = {}
@@ -1260,6 +1211,9 @@ def get_best_repeat_number(df):
         return df['kd_allele']
     else:
         return df.groupby('kd_allele').apply(lambda df2: df)
+
+
+## Tries to determine the minimum number of operations to obtain the original allele, and how to change the corresponding tract lengths.
 def calculate_minimum_operations(source_motif, source_flank, destination_motif, destination_flank):
     destination_operation_list = get_operation_list(destination_motif)
     destination_motif_list = destination_motif.split(',')
@@ -1267,19 +1221,22 @@ def calculate_minimum_operations(source_motif, source_flank, destination_motif, 
     n = len(destination_motif_list)-1
     
     i = 0
-    print(n)
+    #print(n)
     action_list = []
     j = 0
     while i <= n:
-        print(source_motif_list)
-        print(i, n)
+        #print(source_motif_list)
+        #print(i, n)
+        ## Tries to figure out what the next move should be.
         action = determine_next_action(source_motif_list, destination_motif_list, source_flank, destination_flank,destination_operation_list , i, n)
-        print(action)
+        #print(action)
         
         if (action is not None):
             action_list.append(action)
+            ## Some actions lead to non-identifiable tract lengths, and we should just give up.
             if action[0] in ['abort', 'truncate'] or action[2] == 'abort':
                 return action_list
+            ## Figure out of the edit action affect the tract length.
             source_motif_list = apply_action_list(source_motif_list, [action])
             if j == 10:
                 action_list.append(('infinite',0,0,0))
