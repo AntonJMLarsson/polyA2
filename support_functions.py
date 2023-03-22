@@ -12,26 +12,113 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 
 ## used by collect_tag_site_info and get_sequence_pwm
-def summarize_sequence(seq, cutoff):
+def summarize_sequence(seq, cutoff, min_len, break_len):
     pre_string = ''
+    post_string = ''
     A_counter = 0
+    not_A_counter = 0
+    contiguous_A_counter = 0
     pre_string_list = []
+    A_tract_state = False
+    break_state = False
     for b in seq:
         if b == 'A':
-            A_counter += 1
-            if A_counter <= 6:
+            contiguous_A_counter += 1
+            # If we have previously found a non A base, determine if we should count it as the same tract.
+            if break_state:
+                post_string += b
+                # If the previous two bases were As (and less than break_len non-As were found previously), count it as the same tract.
+                if post_string[-(break_len+1):].count("A") == break_len+1:
+                    post_string = ''
+                    break_state = False
+                    A_counter += break_len + 2
+            else:
+                A_counter += 1
                 pre_string += b
-        if b != 'A':
-            if A_counter > 6:
-                pre_string = pre_string.rstrip('A')
+            # here we can decide to enter the "A tract state" based on min_len. If we do, save the bases that precede the A tract.
+            if A_counter >= min_len and not A_tract_state:
+                not_A_counter = 0
+                A_tract_state = True
+                pre_string = pre_string[:-min_len].rstrip('A')
                 pre_string_list.append(pre_string)
-                pre_string = ''
-            A_counter = 0
-            pre_string += b
+            # reset the not_A_counter for every min_len set of straight As in a row. To make sure we can skip multiple non-As that are sufficiently far apart.
+            elif contiguous_A_counter >= min_len:
+                not_A_counter = 0 
+        if b != 'A':
+            # if we are in a tract, determine if we should skip this base.
+            if A_tract_state:
+                break_state = True
+                post_string += b
+                not_A_counter += 1
+                # If we have more than break_len non-As, we are done with this tract and should move on.
+                if not_A_counter > break_len:
+                    pre_string = post_string
+                    post_string = ''
+                    break_state = False
+                    A_tract_state = False
+                    A_counter = 0
+            else:
+                pre_string += b
+                A_counter = 0
+            contiguous_A_counter = 0
+    # figure out what sequence is flanking our tract.
     pre_string_list.append(pre_string[:cutoff])
     return pre_string_list
 
-
+def summarize_sequence_and_count_A_tracts(seq, cutoff, min_len, break_len):
+    pre_string = ''
+    post_string = ''
+    A_counter = 0
+    not_A_counter = 0
+    contiguous_A_counter = 0
+    pre_string_list = []
+    A_count_list = []
+    A_tract_state = False
+    break_state = False
+    for b in seq:
+        if b == 'A':
+            contiguous_A_counter += 1
+            # If we have previously found a non A base, determine if we should count it as the same tract.
+            if break_state:
+                post_string += b
+                # If the previous two bases were As (and less than break_len non-As were found previously), count it as the same tract.
+                if post_string[-(break_len+1):].count("A") == break_len+1:
+                    post_string = ''
+                    break_state = False
+                    A_counter += break_len + 2
+            else:
+                A_counter += 1
+                pre_string += b
+            # here we can decide to enter the "A tract state" based on min_len. If we do, save the bases that precede the A tract.
+            if A_counter >= min_len and not A_tract_state:
+                not_A_counter = 0
+                A_tract_state = True
+                pre_string = pre_string[:-min_len].rstrip('A')
+                pre_string_list.append(pre_string)
+            # reset the not_A_counter for every min_len set of straight As in a row. To make sure we can skip multiple non-As that are sufficiently far apart.
+            elif contiguous_A_counter >= min_len:
+                not_A_counter = 0 
+        if b != 'A':
+            # if we are in a tract, determine if we should skip this base.
+            if A_tract_state:
+                break_state = True
+                post_string += b
+                not_A_counter += 1
+                # If we have more than break_len non-As, we are done with this tract and should move on.
+                if not_A_counter > break_len:
+                    pre_string = post_string
+                    post_string = ''
+                    break_state = False
+                    A_tract_state = False
+                    A_count_list.append(A_counter)
+                    A_counter = 0
+            else:
+                pre_string += b
+                A_counter = 0
+            contiguous_A_counter = 0
+    # figure out what sequence is flanking our tract.
+    pre_string_list.append(pre_string[:cutoff])
+    return pre_string_list, A_count_list
 
 def find_cells_with_sequence(read_dict, seq):
     cell_list = []
@@ -102,7 +189,7 @@ def collect_tag_site_numbers(bamfile, cell_BC_set, insertion_dict, key):
     return key, tagmentation_sites_counter
 
 ## used by get_alleles_by_tagmentation_site, collects the sequence summaries for each tagmentation site within each cell.
-def collect_tag_site_info(bamfile, cell_BC_set, insertion_dict):
+def collect_tag_site_info(bamfile, cell_BC_set, insertion_dict, min_len, break_len):
     bam = pysam.AlignmentFile(bamfile,'rb')
     tagmentation_site_per_allele = {cell: {} for cell in cell_BC_set}
     for read in bam.fetch(insertion_dict['chrom'],insertion_dict['start'],insertion_dict['end']):
@@ -110,7 +197,7 @@ def collect_tag_site_info(bamfile, cell_BC_set, insertion_dict):
         if cell in cell_BC_set:
             if correct_orientation(read, insertion_dict['strand']):
                 seq = read.get_tag('LS')
-                seq_summary = ','.join(summarize_sequence(seq,5))
+                seq_summary = ','.join(summarize_sequence(seq,5, min_len, break_len))
                 tagmentation_site = read.reference_end if read.is_reverse else read.reference_start
                 if seq_summary in tagmentation_site_per_allele[cell]:
                     tagmentation_site_per_allele[cell][seq_summary].append(tagmentation_site)
@@ -178,10 +265,11 @@ def get_allele_coupling(tagmentation_site_per_allele_counter, allele_counter):
                 for other_key in other_allele_keys:
                     allele_count_k[allele_key].update({other_key: tag_site_dict[other_key]})
     return allele_count_n, allele_count_k
+
 ## used in main
-def get_alleles_by_tagmentation_site(bamfile, cell_BC_set, insertion_dict, key):
+def get_alleles_by_tagmentation_site(bamfile, cell_BC_set, insertion_dict, key, min_len, break_len):
     
-    tagmentation_site_per_allele_counter = collect_tag_site_info(bamfile, cell_BC_set, insertion_dict)
+    tagmentation_site_per_allele_counter = collect_tag_site_info(bamfile, cell_BC_set, insertion_dict, min_len, break_len)
     allele_counter, tag_site_distribution_dict, count_distribution_dict, cell_w_counts, cell_w_tag_site = get_correct_alleles(tagmentation_site_per_allele_counter)
     
     allele_count_n, allele_count_k = get_allele_coupling(tagmentation_site_per_allele_counter, allele_counter)
@@ -218,9 +306,11 @@ def get_operation_list(destination_motif):
             op_seq = get_op_seq(seq)
             operation_list.append((seq, op_seq))
     return operation_list
+
 def hamming_distance_unequal(s1, s2):
     min_length = min(len(s1), len(s2))
     return sum(ch1 != ch2 for ch1,ch2 in zip(s1[:min_length],s2[:min_length]))
+
 def determine_adding_action(source_motif_list, destination_motif_list, source_flank, destination_flank):
     # Find the sequence from the destination list to add to the source motif list and where
     
@@ -239,6 +329,7 @@ def determine_adding_action(source_motif_list, destination_motif_list, source_fl
     k = min(lev_distance, key=lev_distance.get)
     action = ('insert', k,k,destination_motif_list[k])
     return action
+
 def determine_remove_action(source_motif_list, destination_motif_list, source_flank, destination_flank):
     # Find the best sequence from the source list to remove
     for i, seq in enumerate(source_motif_list):
@@ -255,6 +346,7 @@ def determine_remove_action(source_motif_list, destination_motif_list, source_fl
             lev_distance[k] += Levenshtein.distance(seq1, seq2)
     action = ('remove', min(lev_distance, key=lev_distance.get), 0, '')
     return action
+
 def determine_increasing_action(source_seq, destination_seq, operations, source_flank, destination_flank, i, n):
     if i == 0:
         
@@ -303,6 +395,7 @@ def determine_increasing_action(source_seq, destination_seq, operations, source_
             else:
                 action = ('append', i, 0, append_seq)
     return action
+
 def determine_decreasing_action(source_seq, destination_seq, source_operations,source_flank, destination_flank, i, n):
     if i == 0:
         
@@ -350,6 +443,7 @@ def determine_decreasing_action(source_seq, destination_seq, source_operations,s
             else:
                 action = ('strip', i, rstrip_len, 'r')
     return action
+
 def determing_editing_action(source_seq, destination_seq, destination_operations, source_operations, source_flank, destination_flank, i, n):
     if i == n:
         edit_dist = hamming_distance_unequal(source_flank, destination_flank)
@@ -375,6 +469,7 @@ def determing_editing_action(source_seq, destination_seq, destination_operations
                 action = ('edit', i, j, d_char)
                 return action
     return action
+
 def determine_next_action(source_motif_list, destination_motif_list, source_flank, destination_flank, destination_operation_list, i, n):
     # if the source motif is shorter than destination, we need to add a sequence. 
     # we'll start with insert, but split is TODO. If we insert, polyA information is lost.
@@ -399,6 +494,7 @@ def determine_next_action(source_motif_list, destination_motif_list, source_flan
             source_operations = get_operation_list(','.join(source_motif_list))[i]
             action = determing_editing_action(source_seq, destination_seq, destination_operations, source_operations, source_flank, destination_flank, i, n)
     return action
+
 ## used by collect_flanking_sequences
 def group_identical_reads(read_dict):
     identical_reads = {}
@@ -411,11 +507,11 @@ def group_identical_reads(read_dict):
     return identical_reads
 
 ## used by collect_flanking_sequences
-def group_sequences(identical_reads):
+def group_sequences(identical_reads, min_len, break_len):
     sequence_summaries_count = Counter()
     sequence_summaries = {}
     for seq,n in identical_reads.items():
-        s = ','.join(summarize_sequence(seq,5))
+        s = ','.join(summarize_sequence(seq,5, min_len, break_len))
         if s in sequence_summaries:
             sequence_summaries[s].append(seq)
         else:
@@ -434,8 +530,9 @@ def get_sequence_pwm(seqs, identical_reads):
             c[k] = n
         base_freqs.update(c)
     return base_freqs
+
 ## used by find_transformations
-def collect_flanking_sequences(bamfile, cell_BC_set, insertion_dict, allele_list):
+def collect_flanking_sequences(bamfile, cell_BC_set, insertion_dict, allele_list, min_len, break_len):
     bam = pysam.AlignmentFile(bamfile, 'r')
 
     read_dict = {cell: [] for cell in cell_BC_set}
@@ -450,7 +547,7 @@ def collect_flanking_sequences(bamfile, cell_BC_set, insertion_dict, allele_list
     read_dict = {cell: l for cell, l in read_dict.items() if len(l) > 0}
 
     identical_reads = group_identical_reads(read_dict)
-    sequence_summaries,sequence_summaries_count = group_sequences(identical_reads)
+    sequence_summaries,sequence_summaries_count = group_sequences(identical_reads, min_len, break_len)
     
     cpm_dict = {}
     for allele_key in allele_list:
@@ -464,30 +561,35 @@ def collect_flanking_sequences(bamfile, cell_BC_set, insertion_dict, allele_list
     return cpm_dict
 
 ## skipped for now in main
-def find_transformations(bamfile, cell_BC_set, insertion_dict, allele_call, key):
+def find_transformations(bamfile, cell_BC_set, insertion_dict, allele_call, key, min_len, break_len):
     ## Find out how the tract is flanked.
-    cpm_dict = collect_flanking_sequences(bamfile, cell_BC_set, insertion_dict, allele_call)
+    cpm_dict = collect_flanking_sequences(bamfile, cell_BC_set, insertion_dict, allele_call, min_len, break_len)
     flanking_dict = {allele_key: cpm.consensus for allele_key, cpm in cpm_dict.items()}
     operations_dict = {k: {} for k in flanking_dict.keys()}
     for k1, k2 in permutations(flanking_dict, 2):
         operations_dict[k1][k2] = calculate_minimum_operations(k1, flanking_dict[k1], k2, flanking_dict[k2])
     return key, operations_dict
-def find_transformation_errors_per_allele(bamfile, cell_BC_set, insertion_dict, noise_dict, key):
+
+
+def find_transformation_errors_per_allele(bamfile, cell_BC_set, insertion_dict, noise_dict, key, min_len, break_len):
     res_dict = {}
     for origin_allele, noise_alleles in noise_dict.items():
-        res_dict[origin_allele] = find_transformation_errors(bamfile, cell_BC_set, insertion_dict, origin_allele, noise_alleles, key)
+        res_dict[origin_allele] = find_transformation_errors(bamfile, cell_BC_set, insertion_dict, origin_allele, noise_alleles, key, min_len, break_len)
     return res_dict
-def find_transformation_errors(bamfile, cell_BC_set, insertion_dict, origin_allele, noise_alleles, key):
+
+
+def find_transformation_errors(bamfile, cell_BC_set, insertion_dict, origin_allele, noise_alleles, key, min_len, break_len):
     all_alleles = noise_alleles.copy()
     all_alleles.append(origin_allele)
-    cpm_dict = collect_flanking_sequences(bamfile, cell_BC_set, insertion_dict, all_alleles)
+    cpm_dict = collect_flanking_sequences(bamfile, cell_BC_set, insertion_dict, all_alleles, min_len, break_len)
     flanking_dict = {allele_key: cpm.consensus for allele_key, cpm in cpm_dict.items()}
     operations_dict = {k: {} for k in flanking_dict.keys()}
     for k1 in noise_alleles:
         operations_dict[k1][origin_allele] = calculate_minimum_operations(k1, flanking_dict[k1], origin_allele, flanking_dict[origin_allele])
     return key, operations_dict
+
 ## used in main, tries to figure out how to edit a sequence summary (and the resulting tract lengths) to obtain the correct histogram.
-def corrrection_to_apply(action_list, destination_allele):
+def correction_to_apply(action_list, destination_allele):
     correction_dict = {i: 0 for i in range(destination_allele.count(','))}
     abort_set = set(['insert', 'abort', 'infinite', 'remove'])
     if any([any([c in abort_set for c in action]) for action in action_list]):
@@ -526,7 +628,7 @@ def get_heterozygous_positions(bamfile, ins_info, key):
                 if a1 != '' and a2 != '':
                     ins_res.append([pileupcolumn.reference_pos, a1, a2, a1_frac, a2_frac])
     return key, ins_res
-def get_allele_to_snp_counts(bamfile, cell_BC_set, insertion_dict, allele_call, het_site, ins_key):
+def get_allele_to_snp_counts(bamfile, cell_BC_set, insertion_dict, allele_call, het_site, ins_key, min_len, break_len):
     bam = pysam.AlignmentFile(bamfile, 'rb')
     allele_to_snp = {allele_summary : Counter({het_site[1]: 0, het_site[2]: 0}) for allele_summary in allele_call.keys()}
     for read in bam.fetch(insertion_dict['chrom'], het_site[0]-1, het_site[0]+1):
@@ -534,7 +636,7 @@ def get_allele_to_snp_counts(bamfile, cell_BC_set, insertion_dict, allele_call, 
         if cell in cell_BC_set:
             if correct_orientation(read, insertion_dict['strand']):
                 seq = read.get_tag('LS')
-                seq_summary = ','.join(summarize_sequence(seq,5))
+                seq_summary = ','.join(summarize_sequence(seq,5, min_len, break_len))
                 if seq_summary in allele_to_snp:
                     pos_list = read.get_reference_positions()
                     seq_list = read.query_alignment_sequence
@@ -546,7 +648,7 @@ def get_allele_to_snp_counts(bamfile, cell_BC_set, insertion_dict, allele_call, 
                         if b in het_site and q > 20:
                             allele_to_snp[seq_summary].update({b:1})
     return allele_to_snp
-def get_CPMs_for_snp(bamfile, cell_BC_set, insertion_dict, het_site, allele_summary):
+def get_CPMs_for_snp(bamfile, cell_BC_set, insertion_dict, het_site, allele_summary, min_len, break_len):
     bam = pysam.AlignmentFile(bamfile, 'r')
     
     flank_dicts = {b: Counter() for b in [het_site[1], het_site[2]]}
@@ -560,7 +662,7 @@ def get_CPMs_for_snp(bamfile, cell_BC_set, insertion_dict, het_site, allele_summ
                 qual_list = read.query_alignment_qualities
                 if het_site[0] in pos_list:
                     seq = read.get_tag('LS')
-                    summary_list = summarize_sequence(seq,1000)
+                    summary_list = summarize_sequence(seq,1000, min_len, break_len)
                     summary_list_small = summary_list.copy()
                     summary_list_small[-1] = summary_list_small[-1][:5]
                     seq_summary_small = ','.join(summary_list_small)
@@ -595,6 +697,7 @@ def get_fraction_less(p, count_dict):
             less += count
             
     return less/total
+
 def get_L1_flank_to_snp_cpm(bamfile, cell_BC_set, insertion_dict, allele_call, het_sites, ins_key):
     output_dict = {}
     allele_summary = list(allele_call.keys())[0]
@@ -636,6 +739,7 @@ def get_L1_flank_to_snp_cpm(bamfile, cell_BC_set, insertion_dict, allele_call, h
             if min([get_fraction_less(pos, flank_size[v]) for v in variants]) > 0.98:
                 variants_phased[p][pos] = {variants[0]: a1, variants[1]: a2}
     return ins_key, variants_phased, unequal_len, output_dict
+
 from scipy.stats import chi2_contingency
 def phase_L1_and_flank_SNV(bamfile, cell_BC_set, insertion_dict, allele_call, het_sites, ins_key):
     output_dict = {}
@@ -644,28 +748,8 @@ def phase_L1_and_flank_SNV(bamfile, cell_BC_set, insertion_dict, allele_call, he
         chi2, p , dof, expected = chi2_contingency([[c for c in variant_counts.values()] for variant_counts in allele_to_snp.values()])
         output_dict[het_site[0]] = (allele_to_snp, chi2, p , dof, expected)
     return ins_key, output_dict
-def summarize_sequence_and_count_A_tracts(seq, cutoff):
-    pre_string = ''
-    A_counter = 0
-    A_count_list = []
-    pre_string_list = []
-    
-    for b in seq:
-        if b == 'A':
-            A_counter += 1
-            if A_counter <= 6:
-                pre_string += b
-        if b != 'A':
-            if A_counter > 6:
-                pre_string = pre_string.rstrip('A')
-                pre_string_list.append(pre_string)
-                pre_string = ''
-                A_count_list.append(A_counter)
-            A_counter = 0
-            pre_string += b
-    pre_string_list.append(pre_string[:cutoff])
-    return pre_string_list, A_count_list
-def get_A_counter_dict(bamfile, cell_BC_set, insertion_dict, allele_call, ins_key, threshold):
+
+def get_A_counter_dict(bamfile, cell_BC_set, insertion_dict, allele_call, ins_key, threshold, min_len, break_len):
     bam = pysam.AlignmentFile(bamfile, 'rb')
     seq_to_count_dict = {}
     allele_summary_set = set(list(allele_call.keys()))
@@ -686,7 +770,7 @@ def get_A_counter_dict(bamfile, cell_BC_set, insertion_dict, allele_call, ins_ke
             else:
                 A_count_dict[cell][seq_info[0]][tagmentation_site] = [seq_info[1]]
         else:
-            pre_string_list, A_count_list = summarize_sequence_and_count_A_tracts(seq, 5)
+            pre_string_list, A_count_list = summarize_sequence_and_count_A_tracts(seq, 5, min_len, break_len)
             seq_summary = ','.join(pre_string_list)
             if seq_summary not in allele_summary_set:
                 continue
@@ -740,7 +824,8 @@ def get_A_counter_dict(bamfile, cell_BC_set, insertion_dict, allele_call, ins_ke
     
     
     return ins_key, A_counter_dict
-def get_A_counter_dict_w_corrections(bamfile, cell_BC_set, insertion_dict, allele_list, seq_to_correct_per_allele, allele_call, ins_key, threshold):
+
+def get_A_counter_dict_w_corrections(bamfile, cell_BC_set, insertion_dict, allele_list, seq_to_correct_per_allele, allele_call, ins_key, threshold, min_len, break_len):
     bam = pysam.AlignmentFile(bamfile, 'rb')
     seq_to_count_dict = {}
     allele_summary_set = set(allele_list)
@@ -765,7 +850,7 @@ def get_A_counter_dict_w_corrections(bamfile, cell_BC_set, insertion_dict, allel
             else:
                 A_count_dict[cell][seq_info[0]][tagmentation_site] = [seq_info[1]]
         else:
-            pre_string_list, A_count_list = summarize_sequence_and_count_A_tracts(seq, 5)
+            pre_string_list, A_count_list = summarize_sequence_and_count_A_tracts(seq, 5,  min_len, break_len)
             seq_summary = ','.join(pre_string_list)
             if seq_summary not in allele_summary_set and seq_summary not in seq_summaries_to_correct:
                 continue
@@ -851,8 +936,9 @@ def get_A_counter_dict_w_corrections(bamfile, cell_BC_set, insertion_dict, allel
                         A_counter_dict[cell][a_idx][p][j].update(A_counter)
     
     return ins_key, A_counter_dict
-def get_histogram_dfs(bamfile, cell_BC_set, insertion_dict, allele_list, seq_to_correct_per_allele, allele_call, ins_key, threshold):
-    tup = get_A_counter_dict_w_corrections(bamfile, cell_BC_set, insertion_dict, allele_list, seq_to_correct_per_allele, allele_call, ins_key, threshold)
+
+def get_histogram_dfs(bamfile, cell_BC_set, insertion_dict, allele_list, seq_to_correct_per_allele, allele_call, ins_key, threshold, min_len, break_len):
+    tup = get_A_counter_dict_w_corrections(bamfile, cell_BC_set, insertion_dict, allele_list, seq_to_correct_per_allele, allele_call, ins_key, threshold, min_len, break_len)
     ins_key, A_counter_dict = tup
 
     df_list = []
@@ -884,6 +970,7 @@ def get_histogram_dfs(bamfile, cell_BC_set, insertion_dict, allele_list, seq_to_
         return ins_key, df
     
     return ins_key, test
+
 def find_biallelic_boundaries(peak_df):
     biallelic_boundaries = {}
     num_peaks = peak_df['read_num']
@@ -914,6 +1001,7 @@ def find_biallelic_boundaries(peak_df):
     else:
         return None, None, None
     return biallelic_peaks, biallelic_boundaries, min_peak, total_diff
+
 def scan_for_biallelic_signal(test_peaks):
     insertion_boundary = None
     insertion_boundary_min = 100
@@ -942,6 +1030,7 @@ def get_allele_index(a_key, tract_site, tract_categorization_cell):
             return tract_categorization_cell[tract_site]
         else:
             return None
+
 def get_final_stats_to_write(test, ins_key, insertion_dict):
     n_alleles = test.groupby('a_key').count().shape[0]
     if n_alleles == 1:
@@ -1030,6 +1119,7 @@ def get_final_stats_to_write(test, ins_key, insertion_dict):
             for t_key, v in a_stats.items():
                 final_stats_unique_key[cell]['{}_{}_{}'.format(ins_key, a_key,t_key)] = v
     return final_stats_unique_key, cell_detection_stats
+
 def find_original_alleles(tract_stats):
     kd_allele_per_tract = {}
     kd_allele_and_hist_peak = {}
@@ -1057,11 +1147,13 @@ def find_original_alleles(tract_stats):
             hist_peaks = kd_allele_and_hist_peak[allele_idx][tract_idx][most_common_kd[0]].most_common()[0]
             hist_peak_dict[(allele_idx, tract_idx)] = hist_peaks[0]
     return original_alleles, hist_peak_dict
+
 def max_reads_fun(tract_d):
     c = Counter()
     for tag_site, tag_tup in tract_d.items():
         c.update({tag_tup[0]: tag_tup[2]})
     return c.most_common()[0][0]
+
 def make_determine_function(original_lengths):
     def return_value(tract_d, allele_idx, tract_idx):
         c = Counter()
@@ -1071,6 +1163,7 @@ def make_determine_function(original_lengths):
             c.update({tag_tup[0]: tag_tup[2]})
         return c.most_common()[0][0]
     return return_value
+
 def find_most_likely_length(tract_stats, determine_fun):
     final_stats = {}
     for cell, stats_dict in tract_stats.items():
@@ -1080,16 +1173,19 @@ def find_most_likely_length(tract_stats, determine_fun):
             for tract_idx, tract_d in allele_d.items():
                 final_stats[cell][allele_idx][tract_idx] = determine_fun(tract_d, allele_idx, tract_idx)
     return final_stats
+
 def add_root_to_df(df):
     root = df.median()
     root.name = 'ROOT'
     df = df.append(root)
     return df 
+
 import seaborn as sns
 def get_median_of_tracts(df):
     s = df.groupby('a_key').apply(lambda df2: df2.groupby('t_key').apply(lambda df3: df3.groupby('kd_allele').count().idxmax()))['hist_peak']
     s.name = 'zygote_tract'
     return s
+
 def get_false_positive_rate(key, histogram_df):
     n_alleles = histogram_df.groupby('a_key').count().shape[0]
     if n_alleles == 1:
@@ -1110,6 +1206,7 @@ def get_false_positive_rate(key, histogram_df):
                 total_obs[allele,tract] += is_zygote_tract.shape[0]
                 agreeing_obs[allele,tract] += is_zygote_tract.sum()
     return key, zygote_tracts, total_obs, agreeing_obs
+
 def get_mutated_cells_fun(zygote_tracts):
     def get_mutated_cells(df):
         cell_list = []
@@ -1122,6 +1219,7 @@ def get_mutated_cells_fun(zygote_tracts):
         cell_list = list(set(cell_list))
         return cell_list
     return get_mutated_cells
+
 def get_cells_with_match(df, a_key, t_key, kd_allele):
     df_reset = df.reset_index()
     df_subset = df_reset[(df_reset['a_key'] == a_key)&(df_reset['t_key'] == t_key)&(df_reset['kd_allele'] == kd_allele)]
@@ -1131,10 +1229,12 @@ def get_cells_with_match(df, a_key, t_key, kd_allele):
         if len(set(df_cell['kd_allele'])) == 1:
             cell_list.append(cell)
     return cell_list
+
 def get_cells_w_value(df, a_key,t_key):
     df_reset = df.reset_index()
     df_subset = df_reset[(df_reset['a_key'] == a_key)&(df_reset['t_key'] == t_key)&(df_reset['kd_allele'].notna())]
     return df_subset['cell'].unique()
+
 def get_mutated_cells_fun(zygote_tracts):
     def get_mutated_cells(df):
         tract_mutation_dict = {}
@@ -1323,8 +1423,8 @@ def get_end_consensus(seqs):
         end_flank_list.append(flanking_sequences[-1])
     cons_seq = get_consensus_sequence(end_flank_list)
     return cons_seq
-def get_tag_site_dist(bamfile, cell_BC_set, insertion_dict, key):
-    tagmentation_site_per_allele_counter = collect_tag_site_info(bamfile, cell_BC_set, insertion_dict)
+def get_tag_site_dist(bamfile, cell_BC_set, insertion_dict, key, min_len, break_len):
+    tagmentation_site_per_allele_counter = collect_tag_site_info(bamfile, cell_BC_set, insertion_dict, min_len, break_len)
     tag_site_dists = Counter()
     for cell, d in tagmentation_site_per_allele_counter.items():
         tag_site_dists.update({len(d):1})

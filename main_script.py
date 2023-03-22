@@ -12,19 +12,23 @@ def main():
     parser.add_argument('-s', '--samplesheet', metavar='samplesheet', type=str, help='Samplesheet, needs BCSet column')
     parser.add_argument('-p', '--prefix', metavar='prefix', type=str, help='Output prefix')
     parser.add_argument('--threshold', type=int, default=10, help='Read threshold to include.')
+    parser.add_argument('--min_len', type=int, default=6, help='Minimum length to classify a polyA as a tract.')
+    parser.add_argument('--break_len', type=int, default=0, help='Number of non-A bases allowed to interrupt a polyA tract.')
     args = parser.parse_args()
 
     bamfile = args.input
     threads = args.threads
     samplesheet_file = args.samplesheet
     prefix = args.prefix
+    min_len = args.min_len
+    break_len = args.break_len
     
     insertion_information = pd.read_csv(args.insertions, index_col = 0).T.to_dict()
     samplesheet = pd.read_csv(samplesheet_file, index_col=0)
     samplesheet_DNA = samplesheet[(samplesheet['Modality'] == 'DNA')]
     cell_BC_set = set(samplesheet_DNA.index)
     
-    res = Parallel(n_jobs=threads, verbose = 3)(delayed(get_alleles_by_tagmentation_site)(bamfile, cell_BC_set, insertion_dict,key) for key, insertion_dict in insertion_information.items())
+    res = Parallel(n_jobs=threads, verbose = 3)(delayed(get_alleles_by_tagmentation_site)(bamfile, cell_BC_set, insertion_dict,key, min_len, break_len) for key, insertion_dict in insertion_information.items())
 
     res_dict = {t[0]: t[1] for t in res}
 
@@ -79,6 +83,7 @@ def main():
             #print('\t', allele, res_dict[ins_key]['allele_count_n'][allele])
             noise_dict = res_dict[ins_key]['allele_count_k'][allele]
             for noise_allele, noise_count in noise_dict.items():
+                # If there are more than 200 reads coming from this noisy version, try to find a transformation to the true allele.
                 if noise_count > 200 and noise_allele != allele:
                     corrections_to_find[ins_key][allele].append(noise_allele)
  
@@ -94,10 +99,10 @@ def main():
             for correction_seq, action_dict in transformations[1].items():
                 if len(action_dict) == 0:
                     continue
-                count_correction_dict[ins_key][allele_key][correction_seq] = corrrection_to_apply(action_dict[allele_key], allele_key)
+                count_correction_dict[ins_key][allele_key][correction_seq] = correction_to_apply(action_dict[allele_key], allele_key)
                 
     ## Make histograms with the corrections applied.
-    histogram_dfs_res = Parallel(n_jobs=threads, verbose = 3)(delayed(get_histogram_dfs)(bamfile, cell_BC_set, insertion_information[ins_key], list(allele_calls[ins_key].keys()), count_correction_dict[ins_key], allele_calls[ins_key], ins_key, args.threshold) for ins_key in allele_calls.keys())
+    histogram_dfs_res = Parallel(n_jobs=threads, verbose = 3)(delayed(get_histogram_dfs)(bamfile, cell_BC_set, insertion_information[ins_key], list(allele_calls[ins_key].keys()), count_correction_dict[ins_key], allele_calls[ins_key], ins_key, args.threshold, min_len, break_len) for ins_key in allele_calls.keys())
     histogram_dfs_res_dict = {k:v for k,v in histogram_dfs_res}
     with open('{}_histogram_dfs.pkl'.format(prefix), 'wb') as handle:
         pickle.dump(histogram_dfs_res_dict, handle,  protocol=pickle.HIGHEST_PROTOCOL)
