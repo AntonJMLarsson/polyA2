@@ -87,7 +87,7 @@ def main():
                 if noise_count > 200 and noise_allele != allele:
                     corrections_to_find[ins_key][allele].append(noise_allele)
  
-    transformation_errors_res = Parallel(n_jobs=threads, verbose = 3)(delayed(find_transformation_errors_per_allele)(bamfile, cell_BC_set, insertion_information[key], corrections_to_find[key], key) for key in corrections_to_find.keys())
+    transformation_errors_res = Parallel(n_jobs=threads, verbose = 3)(delayed(find_transformation_errors_per_allele)(bamfile, cell_BC_set, insertion_information[key], corrections_to_find[key], key, min_len, break_len) for key in corrections_to_find.keys())
     transformation_corrections_dict = {ins_key: transformation_correction for ins_key,transformation_correction in zip(corrections_to_find.keys(),transformation_errors_res)}
     
     ## Figure out how to correct the tract lengths for common errors.

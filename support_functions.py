@@ -118,6 +118,7 @@ def summarize_sequence_and_count_A_tracts(seq, cutoff, min_len, break_len):
             contiguous_A_counter = 0
     # figure out what sequence is flanking our tract.
     pre_string_list.append(pre_string[:cutoff])
+    A_count_list.append(A_counter)
     return pre_string_list, A_count_list
 
 def find_cells_with_sequence(read_dict, seq):
@@ -192,6 +193,9 @@ def collect_tag_site_numbers(bamfile, cell_BC_set, insertion_dict, key):
 def collect_tag_site_info(bamfile, cell_BC_set, insertion_dict, min_len, break_len):
     bam = pysam.AlignmentFile(bamfile,'rb')
     tagmentation_site_per_allele = {cell: {} for cell in cell_BC_set}
+    contigs = set([d['SN'] for d in bam.header['SQ']])
+    if insertion_dict['chrom'] not in contigs:
+        return tagmentation_site_per_allele
     for read in bam.fetch(insertion_dict['chrom'],insertion_dict['start'],insertion_dict['end']):
         cell = read.get_tag('BC')
         if cell in cell_BC_set:
@@ -520,10 +524,10 @@ def group_sequences(identical_reads, min_len, break_len):
     return sequence_summaries,sequence_summaries_count
 
 ## used by collect_flanking_sequences
-def get_sequence_pwm(seqs, identical_reads):
+def get_sequence_pwm(seqs, identical_reads, min_len, break_len):
     base_freqs = Counter()
     for seq in seqs:
-        last_sequence = summarize_sequence(seq,1000)[-1]
+        last_sequence = summarize_sequence(seq,1000, min_len, break_len)[-1]
         c = Counter(enumerate(last_sequence))
         n = identical_reads[seq]
         for k in c.keys():
@@ -551,7 +555,7 @@ def collect_flanking_sequences(bamfile, cell_BC_set, insertion_dict, allele_list
     
     cpm_dict = {}
     for allele_key in allele_list:
-        d = get_sequence_pwm(sequence_summaries[allele_key], identical_reads)
+        d = get_sequence_pwm(sequence_summaries[allele_key], identical_reads, min_len, break_len)
         pfm = pd.Series(d).unstack(fill_value=0).drop('N', errors='ignore',axis=1)
         for b in ['A','T', 'C', 'G']:
             if b not in pfm.columns:
