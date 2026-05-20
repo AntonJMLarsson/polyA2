@@ -165,7 +165,7 @@ def reconstruct_bottleneck_sequence(seq, flank_sequence, A_tract_lengths):
 
 ## used by collect_tag_site_info, ensure the read is in the correct orientation relative to the insertion (always opposite orientation).
 def correct_orientation(read, strand):
-    if (read.is_reverse and strand == '+') or (~read.is_reverse and strand == '-'):
+    if (read.is_reverse and strand == '+') or (not read.is_reverse and strand == '-'):
         return True
     else:
         return False
@@ -702,11 +702,11 @@ def get_fraction_less(p, count_dict):
             
     return less/total
 
-def get_L1_flank_to_snp_cpm(bamfile, cell_BC_set, insertion_dict, allele_call, het_sites, ins_key):
+def get_L1_flank_to_snp_cpm(bamfile, cell_BC_set, insertion_dict, allele_call, het_sites, ins_key, min_len, break_len):
     output_dict = {}
     allele_summary = list(allele_call.keys())[0]
     for het_site in het_sites:
-        cpm_dicts, flank_size = get_CPMs_for_snp(bamfile, cell_BC_set, insertion_dict, het_site, allele_summary)
+        cpm_dicts, flank_size = get_CPMs_for_snp(bamfile, cell_BC_set, insertion_dict, het_site, allele_summary, min_len, break_len)
         if cpm_dicts is None:
             return ins_key, None, None
         output_dict[het_site[0]] = (cpm_dicts, flank_size)
@@ -745,12 +745,77 @@ def get_L1_flank_to_snp_cpm(bamfile, cell_BC_set, insertion_dict, allele_call, h
     return ins_key, variants_phased, unequal_len, output_dict
 
 from scipy.stats import chi2_contingency
-def phase_L1_and_flank_SNV(bamfile, cell_BC_set, insertion_dict, allele_call, het_sites, ins_key):
+def phase_L1_and_flank_SNV(bamfile, cell_BC_set, insertion_dict, allele_call, het_sites, ins_key, min_len, break_len):
     output_dict = {}
     for het_site in het_sites:
-        allele_to_snp = get_allele_to_snp_counts(bamfile, cell_BC_set, insertion_dict, allele_call, het_site, ins_key)
+        allele_to_snp = get_allele_to_snp_counts(bamfile, cell_BC_set, insertion_dict, allele_call, het_site, ins_key, min_len, break_len)
         chi2, p , dof, expected = chi2_contingency([[c for c in variant_counts.values()] for variant_counts in allele_to_snp.values()])
         output_dict[het_site[0]] = (allele_to_snp, chi2, p , dof, expected)
+    return ins_key, output_dict
+
+def get_biallele_to_snp_counts(bamfile, cell_BC_set, insertion_dict, allele_call, het_site, test_peaks, boundaries_dict, min_len, break_len):
+    allele_summary = list(allele_call.keys())[0]
+
+    test_peaks_reset = test_peaks.reset_index()
+    cell_tag_assignments = {}
+    for _, row in test_peaks_reset.iterrows():
+        t_key = row['t_key']
+        if t_key not in boundaries_dict:
+            continue
+        hist_peak = row['hist_peak']
+        if np.isnan(hist_peak):
+            continue
+        hist_peak_int = int(hist_peak)
+        if hist_peak_int not in boundaries_dict[t_key]['biallelic_boundaries']:
+            continue
+        allele_idx = boundaries_dict[t_key]['biallelic_boundaries'][hist_peak_int]
+        k = (row['cell'], row['tag_site'])
+        if k not in cell_tag_assignments:
+            cell_tag_assignments[k] = set()
+        cell_tag_assignments[k].add(allele_idx)
+
+    cell_tag_to_biallele = {k: list(v)[0] for k, v in cell_tag_assignments.items() if len(v) == 1}
+
+    biallele_to_snp = {0: Counter({het_site[1]: 0, het_site[2]: 0}),
+                       1: Counter({het_site[1]: 0, het_site[2]: 0})}
+
+    bam = pysam.AlignmentFile(bamfile, 'rb')
+    for read in bam.fetch(insertion_dict['chrom'], het_site[0]-1, het_site[0]+1):
+        cell = read.get_tag('BC')
+        if cell not in cell_BC_set:
+            continue
+        if not correct_orientation(read, insertion_dict['strand']):
+            continue
+        seq = read.get_tag('LS')
+        seq_summary = ','.join(summarize_sequence(seq, 5, min_len, break_len))
+        if seq_summary != allele_summary:
+            continue
+        tag_site = read.reference_end if read.is_reverse else read.reference_start
+        if (cell, tag_site) not in cell_tag_to_biallele:
+            continue
+        allele_idx = cell_tag_to_biallele[(cell, tag_site)]
+        pos_list = read.get_reference_positions()
+        seq_list = read.query_alignment_sequence
+        qual_list = read.query_alignment_qualities
+        if het_site[0] in pos_list:
+            idx = pos_list.index(het_site[0])
+            b = seq_list[idx]
+            q = qual_list[idx]
+            if b in [het_site[1], het_site[2]] and q > 20:
+                biallele_to_snp[allele_idx].update({b: 1})
+    return biallele_to_snp
+
+def phase_biallelic_signal_and_SNV(bamfile, cell_BC_set, insertion_dict, allele_call, het_sites, ins_key, test_peaks, biallele_result, min_len, break_len):
+    boundaries_dict, _, _ = biallele_result
+    output_dict = {}
+    for het_site in het_sites:
+        biallele_to_snp = get_biallele_to_snp_counts(bamfile, cell_BC_set, insertion_dict, allele_call, het_site, test_peaks, boundaries_dict, min_len, break_len)
+        contingency = [[c for c in variant_counts.values()] for variant_counts in biallele_to_snp.values()]
+        try:
+            chi2, p, dof, expected = chi2_contingency(contingency)
+        except ValueError:
+            chi2, p, dof, expected = None, None, None, None
+        output_dict[het_site[0]] = (biallele_to_snp, chi2, p, dof, expected)
     return ins_key, output_dict
 
 def get_A_counter_dict(bamfile, cell_BC_set, insertion_dict, allele_call, ins_key, threshold, min_len, break_len):
@@ -975,6 +1040,7 @@ def get_histogram_dfs(bamfile, cell_BC_set, insertion_dict, allele_list, seq_to_
     
     return ins_key, test
 
+from collections import Counter
 def find_biallelic_boundaries(peak_df):
     biallelic_boundaries = {}
     num_peaks = peak_df['read_num']
@@ -982,13 +1048,14 @@ def find_biallelic_boundaries(peak_df):
     num_peaks_sorted = num_peaks_sorted.reset_index()
     num_peaks_sorted.index = num_peaks_sorted['hist_peak']
     biallelic_peaks = None
+    num_peaks_sorted = num_peaks_sorted.astype(int)
     if num_peaks_sorted.shape[0] > 1:
-        num_peaks_sorted_subset = num_peaks_sorted[-2:]
+        num_peaks_sorted_subset = num_peaks_sorted.iloc[-2:]
         peaks_total = num_peaks_sorted_subset.sum()['read_num']
         if num_peaks_sorted_subset.max()['read_num']/peaks_total < 0.6:
             biallelic_peaks = num_peaks_sorted_subset.index.values
         else:
-            return None, None, None
+            return None, None, None, None
         biallelic_peaks = np.sort(biallelic_peaks)
         min_peak = min(biallelic_peaks)
         difference = int(np.ceil((biallelic_peaks[1]-biallelic_peaks[0]-1)/2))
@@ -1003,28 +1070,42 @@ def find_biallelic_boundaries(peak_df):
             else:
                 biallelic_boundaries[p] = 1
     else:
-        return None, None, None
+        return None, None, None, None
     return biallelic_peaks, biallelic_boundaries, min_peak, total_diff
 
+def make_combined_boundaries_dict(boundaries_dict, test_peaks):
+    test_peaks_reset = test_peaks.reset_index()
+    t_key_to_order = {t_key:i for i,t_key in enumerate(boundaries_dict.keys())}
+    assignment_combinations = Counter()
+    for cell, cell_df in test_peaks_reset.groupby('cell'):
+        for tag_site, tag_site_df in cell_df.groupby('tag_site'):
+            assignment_dict = {}
+            l = [0 for i in range(len(t_key_to_order))]
+            for idx, row in tag_site_df.iterrows():
+                if row['t_key'] in boundaries_dict.keys():
+                    assignment_dict[row['t_key']] = boundaries_dict[row['t_key']]['biallelic_boundaries'][row['hist_peak']]
+            if len(assignment_dict) != len(t_key_to_order):
+                continue
+            for t_key, assignment in assignment_dict.items():
+                l[t_key_to_order[t_key]] = assignment
+            assignment_combinations.update({tuple(l):1})
+    return assignment_combinations, t_key_to_order
+
 def scan_for_biallelic_signal(test_peaks):
-    insertion_boundary = None
-    insertion_boundary_min = 100
-    insertion_boundary_t_key = None
-    insertion_difference = None
-    insertion_peaks = None
+    boundaries_dict = {}
     for t_key, df in test_peaks.groupby('t_key'):
         peak_df = df.groupby('hist_peak').count()
         biallelic_peaks, biallelic_boundaries, min_peak, difference = find_biallelic_boundaries(peak_df)
         if biallelic_boundaries is None:
             continue
         else:
-            if min_peak < insertion_boundary_min:
-                insertion_boundary_min = min_peak
-                insertion_boundary = biallelic_boundaries
-                insertion_boundary_t_key = t_key
-                insertion_difference = difference
-                insertion_peaks = biallelic_peaks
-    return insertion_boundary_t_key, insertion_boundary, insertion_difference
+            boundaries_dict[t_key] = {'biallelic_peaks':biallelic_peaks, 'biallelic_boundaries':biallelic_boundaries, 'min_peak':min_peak, 'difference':difference}
+    if len(boundaries_dict) > 1:
+        assignment_combinations, t_key_to_order = make_combined_boundaries_dict(boundaries_dict, test_peaks)
+    else:
+        assignment_combinations, t_key_to_order = None, None
+    return boundaries_dict, assignment_combinations, t_key_to_order
+
 
 def get_allele_index(a_key, tract_site, tract_categorization_cell):
     if len(tract_categorization_cell) == 0:
@@ -1433,4 +1514,162 @@ def get_tag_site_dist(bamfile, cell_BC_set, insertion_dict, key, min_len, break_
     for cell, d in tagmentation_site_per_allele_counter.items():
         tag_site_dists.update({len(d):1})
     return tag_site_dists
+
+def allele_summary_distance(summary1, summary2):
+    # Allele summaries are comma-separated segments around polyA tracts (N segments = N-1 tracts).
+    # Needleman-Wunsch over segments: match cost = Levenshtein, indel of segment s costs len(s) + 1
+    # (one polyA tract structural change + len(s) flanking characters). Returns (n_tract_diff, seq_edit_dist).
+    parts1 = summary1.split(',')
+    parts2 = summary2.split(',')
+    m, n = len(parts1), len(parts2)
+    total = lambda s: s[0] + s[1]
+    dp = [[None] * (n + 1) for _ in range(m + 1)]
+    dp[0][0] = (0, 0)
+    for i in range(1, m + 1):
+        prev = dp[i - 1][0]
+        dp[i][0] = (prev[0] + 1, prev[1] + len(parts1[i - 1]))
+    for j in range(1, n + 1):
+        prev = dp[0][j - 1]
+        dp[0][j] = (prev[0] + 1, prev[1] + len(parts2[j - 1]))
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            lev = Levenshtein.distance(parts1[i - 1], parts2[j - 1])
+            match_state = (dp[i - 1][j - 1][0], dp[i - 1][j - 1][1] + lev)
+            delete_state = (dp[i - 1][j][0] + 1, dp[i - 1][j][1] + len(parts1[i - 1]))
+            insert_state = (dp[i][j - 1][0] + 1, dp[i][j - 1][1] + len(parts2[j - 1]))
+            dp[i][j] = min([match_state, delete_state, insert_state], key=total)
+    return dp[m][n]
+
+def build_insertion_summary(insertion_information, res_dict, allele_calls,
+                             histogram_dfs_res_dict, peak_based_calling_result_dict,
+                             het_sites_dict, snp_cpm_dict,
+                             phase_allele_snv_dict, phase_biallele_snv_dict):
+    rows = []
+    for ins_key, ins_info in insertion_information.items():
+        row = {
+            'ins_key': ins_key,
+            'chrom': ins_info.get('chrom'),
+            'start': ins_info.get('start'),
+            'end': ins_info.get('end'),
+            'strand': ins_info.get('strand'),
+            'type': ins_info.get('type'),
+        }
+
+        # Allele detection stats
+        if ins_key in res_dict:
+            rd = res_dict[ins_key]
+            row['cell_w_counts'] = rd['cell_w_counts']
+            row['cell_w_tag_site'] = rd['cell_w_tag_site']
+            row['n_allele_candidates'] = len(rd['allele_counter'])
+        else:
+            row['cell_w_counts'] = None
+            row['cell_w_tag_site'] = None
+            row['n_allele_candidates'] = None
+
+        # Sequence-based allele calls
+        if ins_key in allele_calls:
+            ac = allele_calls[ins_key]
+            row['passed_cell_threshold'] = True
+            row['n_alleles_sequence'] = len(ac)
+            row['allele_summaries'] = ';'.join(ac.keys())
+            row['allele_fractions'] = ';'.join(
+                '{:.3f}'.format(v['fraction_tags']) for v in ac.values()
+            )
+            allele_keys = list(ac.keys())
+            if len(allele_keys) > 1:
+                dist_parts = []
+                for i, j in combinations(range(len(allele_keys)), 2):
+                    n_tract_diff, seq_dist = allele_summary_distance(allele_keys[i], allele_keys[j])
+                    if n_tract_diff == 0:
+                        dist_parts.append('{}-{}:seq={}'.format(i, j, seq_dist))
+                    else:
+                        dist_parts.append('{}-{}:tracts={},seq={}'.format(i, j, n_tract_diff, seq_dist))
+                row['allele_edit_distances'] = ';'.join(dist_parts)
+            else:
+                row['allele_edit_distances'] = None
+        else:
+            row['passed_cell_threshold'] = False
+            row['n_alleles_sequence'] = None
+            row['allele_summaries'] = None
+            row['allele_fractions'] = None
+            row['allele_edit_distances'] = None
+
+        # Histogram / kd calling
+        if ins_key in histogram_dfs_res_dict:
+            hdf = histogram_dfs_res_dict[ins_key]
+            row['n_cells_histogram'] = (
+                hdf.index.get_level_values('cell').nunique() if len(hdf) > 0 else 0
+            )
+        else:
+            row['n_cells_histogram'] = None
+
+        # Peak-based biallelic signal
+        if ins_key in peak_based_calling_result_dict:
+            bd, _, _ = peak_based_calling_result_dict[ins_key]
+            row['biallelic_signal_detected'] = True
+            row['biallelic_t_keys'] = ';'.join(str(t) for t in bd.keys())
+            row['biallelic_peaks'] = ';'.join(
+                '{}:{},{}'.format(t, v['biallelic_peaks'][0], v['biallelic_peaks'][1])
+                for t, v in bd.items()
+            )
+        elif ins_key in allele_calls and len(allele_calls[ins_key]) == 1:
+            # Single allele was processed but no biallelic signal found
+            row['biallelic_signal_detected'] = False
+            row['biallelic_t_keys'] = None
+            row['biallelic_peaks'] = None
+        else:
+            # Not applicable: multiple sequence alleles already detected, or cell threshold not met
+            row['biallelic_signal_detected'] = None
+            row['biallelic_t_keys'] = None
+            row['biallelic_peaks'] = None
+
+        # Heterozygous SNP sites
+        row['n_het_sites'] = len(het_sites_dict[ins_key]) if ins_key in het_sites_dict else None
+
+        # SNP CPM calling
+        if ins_key in snp_cpm_dict:
+            snp_res = snp_cpm_dict[ins_key]
+            if snp_res[0] is None:
+                row['snp_cpm_n_phased_variants'] = 0
+                row['snp_cpm_unequal_len'] = None
+            else:
+                variants_phased, unequal_len = snp_res[0], snp_res[1]
+                row['snp_cpm_n_phased_variants'] = sum(len(v) for v in variants_phased.values())
+                row['snp_cpm_unequal_len'] = unequal_len
+        else:
+            row['snp_cpm_n_phased_variants'] = None
+            row['snp_cpm_unequal_len'] = None
+
+        # Phase: sequence alleles vs SNVs
+        if ins_key in phase_allele_snv_dict:
+            phasv = phase_allele_snv_dict[ins_key]
+            p_vals = [v[2] for v in phasv.values() if v[2] is not None]
+            row['phase_allele_snv_min_p'] = min(p_vals) if p_vals else None
+            row['phase_allele_snv_sites'] = ';'.join(
+                '{}(chi2={:.2f},p={:.2e})'.format(pos, v[1], v[2])
+                for pos, v in phasv.items() if v[1] is not None
+            )
+        else:
+            row['phase_allele_snv_min_p'] = None
+            row['phase_allele_snv_sites'] = None
+
+        # Phase: peak-based biallelic signal vs SNVs
+        if ins_key in phase_biallele_snv_dict:
+            pbsv = phase_biallele_snv_dict[ins_key]
+            p_vals = [v[2] for v in pbsv.values() if v[2] is not None]
+            row['phase_biallele_snv_min_p'] = min(p_vals) if p_vals else None
+            row['phase_biallele_snv_sites'] = ';'.join(
+                '{}(chi2={:.2f},p={:.2e})'.format(pos, v[1], v[2])
+                for pos, v in pbsv.items() if v[1] is not None
+            )
+        else:
+            row['phase_biallele_snv_min_p'] = None
+            row['phase_biallele_snv_sites'] = None
+
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame().rename_axis('ins_key')
+    df = pd.DataFrame(rows).set_index('ins_key')
+    return df
 
