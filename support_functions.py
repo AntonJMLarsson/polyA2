@@ -1337,11 +1337,13 @@ def get_mutated_cells_fun(zygote_tracts):
         return tract_mutation_dict
     return get_mutated_cells
 import sys
-sys.path.append("sequencing/calling/")
+import os
+_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.join(_MODULE_DIR, "sequencing", "calling"))
 from sklearn.neighbors import KDTree
 
 import pickle
-with open('hist_map.pickle', 'rb') as f:
+with open(os.path.join(_MODULE_DIR, 'hist_map.pickle'), 'rb') as f:
     hist_map = pickle.load(f)
 def cosine_score_to_dist(alpha):
     return 2*np.sin(np.arccos(1-alpha)/2)

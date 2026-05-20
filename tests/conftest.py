@@ -33,7 +33,6 @@ def _patched_load(f, *args, **kwargs):
 
 
 pickle.load = _patched_load
-os.chdir(ROOT)
 
 import support_functions  # noqa: F401, E402  -- import for side-effect
 
