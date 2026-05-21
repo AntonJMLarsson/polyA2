@@ -1262,8 +1262,7 @@ def find_most_likely_length(tract_stats, determine_fun):
 def add_root_to_df(df):
     root = df.median()
     root.name = 'ROOT'
-    df = df.append(root)
-    return df 
+    return pd.concat([df, root.to_frame().T])
 
 import seaborn as sns
 def get_median_of_tracts(df):
@@ -1339,19 +1338,30 @@ def get_mutated_cells_fun(zygote_tracts):
 import sys
 import os
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(os.path.join(_MODULE_DIR, "sequencing", "calling"))
+# Make the bundled ``sequencing`` package importable, regardless of cwd.
+if _MODULE_DIR not in sys.path:
+    sys.path.insert(0, _MODULE_DIR)
 from sklearn.neighbors import KDTree
 
 import pickle
-with open(os.path.join(_MODULE_DIR, 'hist_map.pickle'), 'rb') as f:
-    hist_map = pickle.load(f)
+_HIST_MAP_PATH = os.path.join(_MODULE_DIR, 'hist_map.pickle')
+try:
+    with open(_HIST_MAP_PATH, 'rb') as f:
+        hist_map = pickle.load(f)
+except TypeError as e:
+    if "'f16'" in str(e):
+        raise RuntimeError(
+            "hist_map.pickle uses legacy float128 ('f16') scalars that can't "
+            "be loaded on this platform. Run "
+            "`python tools/convert_hist_map.py` once to convert it to a "
+            "portable float64 format."
+        ) from e
+    raise
 def cosine_score_to_dist(alpha):
     return 2*np.sin(np.arccos(1-alpha)/2)
 
 def dist_to_cosing_score(d):
     return 1-np.cos(2*np.arcsin(d/2))
-from multi_hists import MonoSimulatedHistogram
-from sklearn.neighbors import KDTree
 LEAF_SIZE = 100 # optimization shows 50-110 are almost the same
 L2normalized_vecs = [(sh._vec/np.linalg.norm(sh._vec, ord=2))[3:50] for sh in hist_map]
 kdtree = KDTree(np.array(L2normalized_vecs), leaf_size=LEAF_SIZE)
