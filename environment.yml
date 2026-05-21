@@ -1,0 +1,20 @@
+name: polyA2
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python>=3.10
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  - matplotlib
+  - seaborn
+  - joblib
+  - h5py
+  - pysam
+  - pytest
+  - pip
+  - pip:
+      - Levenshtein
+      - seqlogo
