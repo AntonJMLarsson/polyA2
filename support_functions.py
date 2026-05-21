@@ -197,6 +197,8 @@ def collect_tag_site_info(bamfile, cell_BC_set, insertion_dict, min_len, break_l
     if insertion_dict['chrom'] not in contigs:
         return tagmentation_site_per_allele
     for read in bam.fetch(insertion_dict['chrom'],insertion_dict['start'],insertion_dict['end']):
+        if read.is_supplementary:
+            continue
         cell = read.get_tag('BC')
         if cell in cell_BC_set:
             if correct_orientation(read, insertion_dict['strand']):
@@ -541,6 +543,8 @@ def collect_flanking_sequences(bamfile, cell_BC_set, insertion_dict, allele_list
 
     read_dict = {cell: [] for cell in cell_BC_set}
     for read in bam.fetch(insertion_dict['chrom'],insertion_dict['start'],insertion_dict['end']):
+        if read.is_supplementary:
+            continue
         cell = read.get_tag('BC')
         if cell in cell_BC_set:
             if correct_orientation(read, insertion_dict['strand']):
@@ -636,6 +640,8 @@ def get_allele_to_snp_counts(bamfile, cell_BC_set, insertion_dict, allele_call, 
     bam = pysam.AlignmentFile(bamfile, 'rb')
     allele_to_snp = {allele_summary : Counter({het_site[1]: 0, het_site[2]: 0}) for allele_summary in allele_call.keys()}
     for read in bam.fetch(insertion_dict['chrom'], het_site[0]-1, het_site[0]+1):
+        if read.is_supplementary:
+            continue
         cell = read.get_tag('BC')
         if cell in cell_BC_set:
             if correct_orientation(read, insertion_dict['strand']):
@@ -658,6 +664,8 @@ def get_CPMs_for_snp(bamfile, cell_BC_set, insertion_dict, het_site, allele_summ
     flank_dicts = {b: Counter() for b in [het_site[1], het_site[2]]}
     flank_size = {b: Counter()  for b in [het_site[1], het_site[2]]}
     for read in bam.fetch(insertion_dict['chrom'], het_site[0]-1, het_site[0]+1):
+        if read.is_supplementary:
+            continue
         cell = read.get_tag('BC')
         if cell in cell_BC_set:
             if correct_orientation(read, insertion_dict['strand']):
@@ -781,6 +789,8 @@ def get_biallele_to_snp_counts(bamfile, cell_BC_set, insertion_dict, allele_call
 
     bam = pysam.AlignmentFile(bamfile, 'rb')
     for read in bam.fetch(insertion_dict['chrom'], het_site[0]-1, het_site[0]+1):
+        if read.is_supplementary:
+            continue
         cell = read.get_tag('BC')
         if cell not in cell_BC_set:
             continue
@@ -825,6 +835,8 @@ def get_A_counter_dict(bamfile, cell_BC_set, insertion_dict, allele_call, ins_ke
     allele_summary_to_id = {a: i for i,a in enumerate(allele_call.keys())}
     A_count_dict = {cell: {a: {} for a in allele_call.keys()} for cell in cell_BC_set}
     for read in bam.fetch(insertion_dict['chrom'], insertion_dict['start'], insertion_dict['end']):
+        if read.is_supplementary:
+            continue
         cell = read.get_tag('BC')
         if cell not in cell_BC_set:
             continue
@@ -905,6 +917,8 @@ def get_A_counter_dict_w_corrections(bamfile, cell_BC_set, insertion_dict, allel
     allele_summary_to_id = {a: i for i,a in enumerate(allele_list)}
     A_count_dict = {cell: {a: {} for a in all_seq_summaries} for cell in cell_BC_set}
     for read in bam.fetch(insertion_dict['chrom'], insertion_dict['start'], insertion_dict['end']):
+        if read.is_supplementary:
+            continue
         cell = read.get_tag('BC')
         if cell not in cell_BC_set:
             continue

@@ -390,3 +390,55 @@ def test_get_heterozygous_positions_detects_het_site(deep_bam):
     # Both fractions should be in (0.4, 0.6).
     assert 0.4 < site[3] < 0.6
     assert 0.4 < site[4] < 0.6
+
+
+# ---------------------------------------------------------------------------
+# Supplementary-read filtering
+# ---------------------------------------------------------------------------
+
+def test_supplementary_reads_are_skipped(tmp_path):
+    """LS-fetching loops must ignore supplementary alignments (flag 0x800).
+
+    Build a BAM with 10 primary reads of allele A and 10 supplementary reads
+    of allele B at the same locus. The supplementary reads must not be
+    counted toward either the tag-site allele dict or the conditional-noise
+    co-observations.
+    """
+    path = tmp_path / "supp.bam"
+    qseq = "N" * 50
+    header = {"HD": {"VN": "1.0", "SO": "coordinate"},
+              "SQ": [{"LN": 10_000, "SN": "chr1"}]}
+    with pysam.AlignmentFile(str(path), "wb", header=header) as bam:
+        for i in range(15):
+            a = pysam.AlignedSegment()
+            a.query_name = f"p{i}"
+            a.query_sequence = qseq
+            a.flag = 16  # reverse, primary
+            a.reference_id = 0
+            a.reference_start = 450
+            a.cigar = [(0, 50)]
+            a.mapping_quality = 60
+            a.query_qualities = pysam.qualitystring_to_array("I" * 50)
+            a.set_tags([("BC", "CELL_A", "Z"), ("LS", LS_A, "Z")])
+            bam.write(a)
+        for i in range(15):
+            a = pysam.AlignedSegment()
+            a.query_name = f"s{i}"
+            a.query_sequence = qseq
+            a.flag = 16 | 0x800  # reverse + supplementary
+            a.reference_id = 0
+            a.reference_start = 450
+            a.cigar = [(0, 50)]
+            a.mapping_quality = 60
+            a.query_qualities = pysam.qualitystring_to_array("I" * 50)
+            a.set_tags([("BC", "CELL_A", "Z"), ("LS", LS_B, "Z")])
+            bam.write(a)
+    pysam.index(str(path))
+
+    out = sf.collect_tag_site_info(
+        str(path), {"CELL_A"}, INSERTION, min_len=6, break_len=0
+    )
+    # Only the 15 primary (allele A) reads should be counted; the
+    # supplementary allele B reads must be filtered out entirely.
+    assert out["CELL_A"][500][SUMMARY_A] == 15
+    assert SUMMARY_B not in out["CELL_A"][500]
