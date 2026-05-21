@@ -1012,7 +1012,10 @@ def get_A_counter_dict_w_corrections(bamfile, cell_BC_set, insertion_dict, allel
                     if len(seq_to_correct_per_allele[original_allele][a].keys()) != len(A_count_list[0]):
                         continue
                     for i, c in seq_to_correct_per_allele[original_allele][a].items():
-                        A_counter = Counter([l[i]+c for l in A_count_list])
+                        # Reads with the same seq_summary can still produce A_count_lists
+                        # of different lengths (a trailing tract that never ended omits
+                        # the final entry), so guard against out-of-range indexing.
+                        A_counter = Counter([l[i]+c for l in A_count_list if i < len(l)])
                     if p not in A_counter_dict[cell][a_idx]:
                         continue
                     for j in range(original_allele.count(',')):
