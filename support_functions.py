@@ -757,8 +757,13 @@ def phase_L1_and_flank_SNV(bamfile, cell_BC_set, insertion_dict, allele_call, he
     output_dict = {}
     for het_site in het_sites:
         allele_to_snp = get_allele_to_snp_counts(bamfile, cell_BC_set, insertion_dict, allele_call, het_site, ins_key, min_len, break_len)
-        chi2, p , dof, expected = chi2_contingency([[c for c in variant_counts.values()] for variant_counts in allele_to_snp.values()])
-        output_dict[het_site[0]] = (allele_to_snp, chi2, p , dof, expected)
+        contingency = [[c for c in variant_counts.values()] for variant_counts in allele_to_snp.values()]
+        try:
+            chi2, p, dof, expected = chi2_contingency(contingency)
+        except ValueError:
+            # All-zero row/column -> chi2 can't be computed for this site.
+            chi2, p, dof, expected = None, None, None, None
+        output_dict[het_site[0]] = (allele_to_snp, chi2, p, dof, expected)
     return ins_key, output_dict
 
 def get_biallele_to_snp_counts(bamfile, cell_BC_set, insertion_dict, allele_call, het_site, test_peaks, boundaries_dict, min_len, break_len):

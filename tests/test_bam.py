@@ -223,6 +223,30 @@ def test_phase_L1_and_flank_SNV_runs_chi2(phase_bam):
     assert p < 0.001
 
 
+def test_phase_L1_and_flank_SNV_handles_empty_row(snp_bam):
+    """When one allele in allele_call has zero reads at the het site, the
+    chi2 contingency table has an all-zero row. The function must not raise
+    — it should record (allele_to_snp, None, None, None, None) for that site."""
+    cell_set = {"CELL_A", "CELL_B"}
+    # snp_bam contains only LS_A (=> SUMMARY_A) reads; SUMMARY_B's row will be all zeros.
+    allele_call = {
+        SUMMARY_A: {"fraction_tags": 0.5},
+        SUMMARY_B: {"fraction_tags": 0.5},
+    }
+    het_sites = [[480, "A", "G", 0.5, 0.5]]
+    key, out = sf.phase_L1_and_flank_SNV(
+        snp_bam, cell_set, INSERTION, allele_call, het_sites, "ins1",
+        min_len=6, break_len=0,
+    )
+    allele_to_snp, chi2, p, dof, expected = out[480]
+    assert chi2 is None and p is None
+    # But the counts dict is still populated.
+    assert allele_to_snp[SUMMARY_A]["A"] == 50
+    assert allele_to_snp[SUMMARY_A]["G"] == 50
+    assert allele_to_snp[SUMMARY_B]["A"] == 0
+    assert allele_to_snp[SUMMARY_B]["G"] == 0
+
+
 # ---------------------------------------------------------------------------
 # Biallelic-signal phasing
 # ---------------------------------------------------------------------------
