@@ -1063,37 +1063,71 @@ def get_histogram_dfs(bamfile, cell_BC_set, insertion_dict, allele_list, seq_to_
     return ins_key, test
 
 from collections import Counter
-def find_biallelic_boundaries(peak_df):
-    biallelic_boundaries = {}
+def find_biallelic_boundaries(peak_df, bic_improvement=10):
+    """
+    Detect bimodal (two-allele) structure in a per-cell hist_peak count distribution.
+
+    Two-stage detection:
+      1. GMM (2-component vs 1-component BIC): catches imbalanced heterozygous loci
+         where one allele is ~2× more common, which the ratio test misses (e.g.
+         chr5_115302 peaks at 15/25, chr16_51679 at 6/20, chr2_69629 at 13/21).
+      2. Ratio fallback: the original 40-60% balance test on the top-2 peaks, which
+         reliably catches adjacent-peak loci (separation 1-2) that the GMM may not
+         resolve as separate Gaussians.  These loci must be split before noise-model
+         pair-counting to avoid inflating epsilon.
+
+    Parameters
+    ----------
+    peak_df        : DataFrame  index=hist_peak, column 'read_num' = cell count
+    bic_improvement: float  minimum ΔBIC(1→2 components) required for GMM stage
+
+    Returns (biallelic_peaks, biallelic_boundaries, min_peak, total_diff) or
+            (None, None, None, None) if neither stage detects bimodality.
+    """
+    from sklearn.mixture import GaussianMixture as _GMM
+
     num_peaks = peak_df['read_num']
-    num_peaks_sorted = num_peaks.sort_values()
-    num_peaks_sorted = num_peaks_sorted.reset_index()
-    num_peaks_sorted.index = num_peaks_sorted['hist_peak']
-    biallelic_peaks = None
-    num_peaks_sorted = num_peaks_sorted.astype(int)
-    if num_peaks_sorted.shape[0] > 1:
-        num_peaks_sorted_subset = num_peaks_sorted.iloc[-2:]
-        peaks_total = num_peaks_sorted_subset.sum()['read_num']
-        if num_peaks_sorted_subset.max()['read_num']/peaks_total < 0.6:
-            biallelic_peaks = num_peaks_sorted_subset.index.values
-        else:
-            return None, None, None, None
-        biallelic_peaks = np.sort(biallelic_peaks)
-        min_peak = min(biallelic_peaks)
-        difference = int(np.ceil((biallelic_peaks[1]-biallelic_peaks[0]-1)/2))
-        total_diff = biallelic_peaks[1]-biallelic_peaks[0]
-        lower_top = biallelic_peaks[0]+difference
-        bottom_lower = biallelic_peaks[1]-difference
-        bottom_a = np.arange(lower_top+1)
-        top_a = np.arange(bottom_lower,50)
-        for p in num_peaks_sorted.index.values:
-            if p in bottom_a:
-                biallelic_boundaries[p] = 0
-            else:
-                biallelic_boundaries[p] = 1
-    else:
+    if len(num_peaks) < 2:
         return None, None, None, None
-    return biallelic_peaks, biallelic_boundaries, min_peak, total_diff
+
+    def _make_result(peak_lo, peak_hi):
+        biallelic_peaks = np.array([peak_lo, peak_hi])
+        total_diff = peak_hi - peak_lo
+        lower_top = peak_lo + int(np.ceil((total_diff - 1) / 2))
+        boundaries = {p: (0 if p <= lower_top else 1) for p in num_peaks.index.values}
+        return biallelic_peaks, boundaries, peak_lo, total_diff
+
+    # --- Stage 1: original 40-60% balance ratio on top-2 peaks (fast) ---
+    num_peaks_sorted = num_peaks.sort_values().reset_index()
+    num_peaks_sorted.index = num_peaks_sorted['hist_peak']
+    num_peaks_sorted = num_peaks_sorted.astype(int)
+    top2 = num_peaks_sorted.iloc[-2:]
+    peaks_total = top2['read_num'].sum()
+    if peaks_total > 0 and top2['read_num'].max() / peaks_total < 0.6:
+        biallelic_peaks = np.sort(top2.index.values)
+        return _make_result(int(biallelic_peaks[0]), int(biallelic_peaks[1]))
+
+    # --- Stage 2: GMM fallback for imbalanced heterozygous loci ---
+    # The ratio test misses loci where one allele is ~2× more common (dominant
+    # fraction ~0.67), e.g. chr5_115302 (15/25), chr16_51679 (6/20).
+    # Guard: minor_weight >= 0.2 ensures both alleles are substantially represented
+    # (genuine heterozygosity), rejecting cases where the GMM places one tiny
+    # component on noise.  min_separation >= 5 avoids stutter noise.
+    observations = np.repeat(
+        num_peaks.index.values.astype(float), num_peaks.values
+    ).reshape(-1, 1)
+    if len(observations) >= 10:
+        gmm1 = _GMM(n_components=1, random_state=0).fit(observations)
+        gmm2 = _GMM(n_components=2, random_state=0).fit(observations)
+        if gmm1.bic(observations) - gmm2.bic(observations) >= bic_improvement:
+            means = np.sort(gmm2.means_.flatten())
+            weights = np.sort(gmm2.weights_.flatten())
+            peak_lo = int(np.round(means[0]))
+            peak_hi = int(np.round(means[1]))
+            if peak_hi - peak_lo >= 5 and weights[0] >= 0.2:
+                return _make_result(peak_lo, peak_hi)
+
+    return None, None, None, None
 
 def make_combined_boundaries_dict(boundaries_dict, test_peaks):
     test_peaks_reset = test_peaks.reset_index()
@@ -1706,4 +1740,701 @@ def build_insertion_summary(insertion_information, res_dict, allele_calls,
         return pd.DataFrame().rename_axis('ins_key')
     df = pd.DataFrame(rows).set_index('ins_key')
     return df
+
+
+# ── Noise-model estimation ──────────────────────────────────────────────────
+
+def get_mismatch_rate_extended(key, histogram_df, value_key='hist_peak',
+                               read_num_threshold=1, biallele_result=None):
+    """
+    Compute inter-tag-site pair mismatch rate for any insertion type.
+
+    Works for both single-allele and two-allele insertions.  For peak-based
+    biallelic insertions pass biallele_result=(boundaries_dict, ...) to split
+    cells into their two allele groups first via biallelic_boundaries.
+
+    The pair mismatch rate P(pair disagrees) ≈ 2ε for small per-observation
+    error rate ε, so ε ≈ pair_mismatch_rate / 2.
+
+    Returns
+    -------
+    key : str
+    ref_lengths : dict {(a_key, t_key): modal_length}  — reference (germline) length
+    total_pairs : dict {(a_key, t_key): n_pairs}
+    agreeing_pairs : dict {(a_key, t_key): n_agreeing_pairs}
+    """
+    df = histogram_df.reset_index()
+
+    if value_key not in df.columns or df[value_key].isna().all():
+        return key, None, None, None
+
+    if read_num_threshold > 1:
+        df = df[df['read_num'] >= read_num_threshold].copy()
+
+    if df.empty:
+        return key, None, None, None
+
+    # For peak-based biallelic insertions: reassign a_key per (cell, tag_site)
+    # using the biallelic_boundaries from scan_for_biallelic_signal.
+    if biallele_result is not None:
+        boundaries_dict, _, _ = biallele_result
+        cell_tag_votes = {}
+        for t_key_b, bd in boundaries_dict.items():
+            bounds = bd['biallelic_boundaries']
+            t_sub = (df[df['t_key'] == t_key_b][['cell', 'tag_site', 'hist_peak']]
+                     .dropna(subset=['hist_peak']))
+            for _, row in t_sub.iterrows():
+                hp = int(row['hist_peak'])
+                if hp not in bounds:
+                    continue
+                k = (row['cell'], row['tag_site'])
+                cell_tag_votes.setdefault(k, set()).add(bounds[hp])
+
+        # Only keep tag sites with an unambiguous allele assignment
+        cell_tag_to_allele = {
+            k: list(v)[0] for k, v in cell_tag_votes.items() if len(v) == 1
+        }
+        if not cell_tag_to_allele:
+            return key, None, None, None
+
+        allele_series = (
+            pd.Series(cell_tag_to_allele, name='_va')
+            .rename_axis(index=['cell', 'tag_site'])
+            .reset_index()
+        )
+        df = df.merge(allele_series, on=['cell', 'tag_site'], how='inner')
+        df['a_key'] = df['_va'].astype(int)
+        df = df.drop(columns=['_va'])
+
+    # Reference length for each (a_key, t_key) = mode across all observations
+    ref_lengths = {}
+    for (a_key, t_key), grp in df.groupby(['a_key', 't_key']):
+        vals = grp[value_key].dropna()
+        if len(vals) == 0:
+            continue
+        ref_lengths[(a_key, t_key)] = vals.mode().iloc[0]
+
+    # Count inter-tag-site pairs within each cell+allele+tract group
+    total_pairs = {k: 0 for k in ref_lengths}
+    agreeing_pairs = {k: 0 for k in ref_lengths}
+
+    for (cell, a_key, t_key), grp in df.groupby(['cell', 'a_key', 't_key']):
+        at_key = (a_key, t_key)
+        if at_key not in ref_lengths:
+            continue
+        calls = grp[value_key].dropna().values
+        if len(calls) < 2:
+            continue
+        n = len(calls)
+        n_pairs = n * (n - 1) // 2
+        # Count agreeing pairs efficiently: Σ C(count(l), 2)
+        counts = Counter(calls)
+        n_agree = sum(c * (c - 1) // 2 for c in counts.values())
+        total_pairs[at_key] += n_pairs
+        agreeing_pairs[at_key] += n_agree
+
+    return key, ref_lengths, total_pairs, agreeing_pairs
+
+
+def build_noise_model(histogram_dfs, peak_based_calling=None,
+                      value_key='hist_peak', read_num_threshold=1,
+                      n_jobs=1):
+    """
+    Estimate the global per-observation noise rate ε(L) by pooling inter-tag-site
+    pair mismatch rates across all insertions.
+
+    The pair mismatch rate P(pair disagrees) ≈ 2ε(1-ε), so ε ≈ P(disagree)/2.
+    This works for any insertion type because it only requires multiple independent
+    tagmentation-site observations per cell — no external reference is needed.
+
+    For peak-based biallelic insertions in peak_based_calling, cells are first split
+    into their two allele groups using biallelic_boundaries before pair-counting.
+
+    Parameters
+    ----------
+    histogram_dfs : dict
+        {ins_key: histogram_df} as produced by the pipeline.
+    peak_based_calling : dict, optional
+        {ins_key: (boundaries_dict, assignment_combinations, t_key_to_order)}.
+    value_key : str
+        Column to use: 'kd_allele' or 'hist_peak'.
+    read_num_threshold : int
+        Minimum reads per tag-site observation to include.
+
+    Returns
+    -------
+    noise_df : pd.DataFrame
+        Columns: tract_length, n_pairs, n_agree_pairs, pair_mismatch_rate,
+                 epsilon, epsilon_se, epsilon_smoothed.
+    noise_fn : callable
+        Smooth ε(L) via linear interpolation (flat extrapolation beyond observed
+        range).  Returns a scalar or array depending on input.
+    """
+    from scipy.interpolate import interp1d
+    from joblib import Parallel, delayed as _delayed
+
+    if peak_based_calling is None:
+        peak_based_calling = {}
+
+    pool = {}  # {tract_length: [n_pairs, n_agree]}
+
+    results = Parallel(n_jobs=n_jobs)(
+        _delayed(get_mismatch_rate_extended)(
+            ins_key, histogram_df,
+            value_key=value_key,
+            read_num_threshold=read_num_threshold,
+            biallele_result=peak_based_calling.get(ins_key),
+        )
+        for ins_key, histogram_df in histogram_dfs.items()
+    )
+
+    for _, ref_lengths, total_pairs, agreeing_pairs in results:
+        if ref_lengths is None:
+            continue
+        for at_key, ref in ref_lengths.items():
+            if pd.isna(ref):
+                continue
+            L = int(ref)
+            if L not in pool:
+                pool[L] = [0, 0]
+            pool[L][0] += total_pairs.get(at_key, 0)
+            pool[L][1] += agreeing_pairs.get(at_key, 0)
+
+    rows = []
+    for L in sorted(pool.keys()):
+        n_p, n_a = pool[L]
+        if n_p < 20:
+            continue
+        pmr = 1.0 - n_a / n_p
+        eps = pmr / 2.0
+        # SE via delta method: SE(ε) = SE(pmr) / 2
+        se = np.sqrt(max(pmr * (1.0 - pmr) / n_p, 0.0)) / 2.0
+        rows.append(dict(
+            tract_length=L,
+            n_pairs=n_p,
+            n_agree_pairs=n_a,
+            pair_mismatch_rate=pmr,
+            epsilon=eps,
+            epsilon_se=se,
+        ))
+
+    if not rows:
+        return pd.DataFrame(), None
+
+    noise_df = (pd.DataFrame(rows)
+                .sort_values('tract_length')
+                .reset_index(drop=True))
+
+    lengths = noise_df['tract_length'].values.astype(float)
+    eps_vals = noise_df['epsilon'].values
+    weights = noise_df['n_pairs'].values.astype(float)
+
+    # Gaussian-kernel-weighted smoothing over ±1.5 length units
+    sigma = 1.5
+    kernels = np.exp(-0.5 * ((lengths[:, None] - lengths[None, :]) / sigma) ** 2)
+    weighted_kernels = kernels * weights[None, :]
+    smoothed = (weighted_kernels * eps_vals[None, :]).sum(axis=1) / weighted_kernels.sum(axis=1)
+    noise_df['epsilon_smoothed'] = smoothed
+
+    noise_fn = interp1d(
+        lengths, smoothed,
+        kind='linear',
+        bounds_error=False,
+        fill_value=(smoothed[0], smoothed[-1]),
+    )
+
+    return noise_df, noise_fn
+
+
+# ── Mutation caller ─────────────────────────────────────────────────────────
+
+def _assign_biallelic_a_key(df, biallele_result):
+    """
+    Reassign a_key in df using peak-based biallelic boundaries.
+    Returns a modified copy of df, or None if no cells could be assigned.
+    """
+    boundaries_dict, _, _ = biallele_result
+    cell_tag_votes = {}
+    for t_key_b, bd in boundaries_dict.items():
+        bounds = bd['biallelic_boundaries']
+        t_sub = (df[df['t_key'] == t_key_b][['cell', 'tag_site', 'hist_peak']]
+                 .dropna(subset=['hist_peak']))
+        for _, row in t_sub.iterrows():
+            hp = int(row['hist_peak'])
+            if hp not in bounds:
+                continue
+            k = (row['cell'], row['tag_site'])
+            cell_tag_votes.setdefault(k, set()).add(bounds[hp])
+
+    cell_tag_to_allele = {k: list(v)[0] for k, v in cell_tag_votes.items() if len(v) == 1}
+    if not cell_tag_to_allele:
+        return None
+
+    allele_series = (pd.Series(cell_tag_to_allele, name='_va')
+                     .rename_axis(index=['cell', 'tag_site'])
+                     .reset_index())
+    df = df.merge(allele_series, on=['cell', 'tag_site'], how='inner')
+    df['a_key'] = df['_va'].astype(int)
+    return df.drop(columns=['_va'])
+
+
+def _reference_lengths(df, value_key):
+    """
+    Compute the population reference length for each (a_key, t_key) as the
+    mode-of-modes across cells (to avoid cells with many tag sites dominating).
+    Returns dict {(a_key, t_key): int}.
+    """
+    # Step 1: mode per cell per (a_key, t_key) — fast via size + first-after-sort
+    per_cell = (
+        df.groupby(['cell', 'a_key', 't_key', df[value_key].rename('_v')])
+        .size()
+        .reset_index(name='_cnt')
+        .sort_values('_cnt', ascending=False)
+        .groupby(['cell', 'a_key', 't_key'])
+        .first()['_v']
+        .reset_index()
+    )
+    # Step 2: mode across cells
+    pop_mode = (
+        per_cell.groupby(['a_key', 't_key', '_v'])
+        .size()
+        .reset_index(name='_cnt')
+        .sort_values('_cnt', ascending=False)
+        .groupby(['a_key', 't_key'])
+        .first()['_v']
+    )
+    return {(int(a), int(t)): int(v) for (a, t), v in pop_mode.items()}
+
+
+def _mutations_one_ins(ins_key, histogram_df, biallele_result, ac, snp_phased,
+                        noise_fn, min_tag_sites, p_threshold, value_key):
+    """
+    Process one insertion for call_mutations.
+    Extracted as a top-level function so joblib can pickle it.
+    Returns (mutation_rows, tested_rows).
+    """
+    from scipy.stats import binom as _binom
+
+    df = histogram_df.reset_index()
+    if value_key not in df.columns or df[value_key].isna().all():
+        return [], []
+
+    if biallele_result is not None:
+        df_split = _assign_biallelic_a_key(df, biallele_result)
+        if df_split is not None:
+            df = df_split
+
+    df_valid = df[df[value_key].notna()]
+    if df_valid.empty:
+        return [], []
+
+    ref_lengths = _reference_lengths(df_valid, value_key)
+    if not ref_lengths:
+        return [], []
+
+    seq_keys = list(ac.keys())
+    n_seq = len(seq_keys)
+
+    other_ref = {}
+    if n_seq == 2 and biallele_result is None:
+        for a_key in (0, 1):
+            other_a = 1 - a_key
+            if a_key >= n_seq or other_a >= n_seq:
+                continue
+            this_seq = seq_keys[a_key]
+            other_seq = seq_keys[other_a]
+            delta = ac[this_seq]['conditional_probs'].get(other_seq, 0.0)
+            for t_key in set(t for (a, t) in ref_lengths if a == other_a):
+                other_L = ref_lengths.get((other_a, t_key))
+                if other_L is not None:
+                    other_ref[(a_key, t_key)] = (other_L, float(delta))
+    elif biallele_result is not None:
+        for a_key in (0, 1):
+            other_a = 1 - a_key
+            for t_key in set(t for (a, t) in ref_lengths if a == other_a):
+                other_L = ref_lengths.get((other_a, t_key))
+                if other_L is not None:
+                    other_ref[(a_key, t_key)] = (other_L, 0.05)
+
+    if snp_phased:
+        tier = 1
+    elif n_seq == 2 and biallele_result is None:
+        max_delta = max(
+            (p for info in ac.values()
+             for p in info.get('conditional_probs', {}).values()),
+            default=0.0)
+        tier = 2 if max_delta < 0.01 else 3
+    elif biallele_result is not None:
+        tier = 4
+    else:
+        tier = 5
+
+    bg_freq = {}
+    for (a_key_g, t_key_g), grp_g in df_valid.groupby(['a_key', 't_key']):
+        at_g = (int(a_key_g), int(t_key_g))
+        length_counts = Counter(grp_g[value_key].values.astype(int))
+        total_g = sum(length_counts.values())
+        bg_freq[at_g] = {L: c / total_g for L, c in length_counts.items()}
+
+    cell_counts_per_at = {}
+    mutation_rows = []
+
+    for (cell, a_key, t_key), grp in df_valid.groupby(['cell', 'a_key', 't_key']):
+        at_key = (int(a_key), int(t_key))
+        if at_key not in ref_lengths:
+            continue
+        calls = grp[value_key].values.astype(int)
+        n = len(calls)
+        if n >= min_tag_sites:
+            cell_counts_per_at[at_key] = cell_counts_per_at.get(at_key, 0) + 1
+        if n < min_tag_sites:
+            continue
+        ref_L = ref_lengths[at_key]
+        counts = Counter(calls)
+        max_count = max(counts.values())
+        if counts[ref_L] >= max_count:
+            continue
+        cell_L = max(counts, key=counts.get)
+        n_agree = counts[cell_L]
+        delta_L = cell_L - ref_L
+        eps = float(np.clip(noise_fn(ref_L), 1e-9, 1.0 - 1e-9))
+        f_bg = bg_freq.get(at_key, {}).get(cell_L, 0.0)
+        background_rate = float(np.clip(max(eps, f_bg), 1e-9, 1.0 - 1e-9))
+        p_noise = float(_binom.sf(n_agree - 1, n, background_rate))
+        bleed_through = np.nan
+        delta_misassign = np.nan
+        p_misassign = 0.0
+        if not snp_phased and at_key in other_ref:
+            other_L, delta = other_ref[at_key]
+            delta_misassign = abs(cell_L - other_L)
+            bleed_through = delta
+            if delta_misassign <= 1:
+                p_misassign = delta
+        p_fp = min(1.0, p_noise + p_misassign)
+        mutation_rows.append(dict(
+            ins_key=ins_key, cell=cell,
+            a_key=int(a_key), t_key=int(t_key),
+            ref_length=ref_L, cell_length=int(cell_L),
+            delta_length=int(delta_L),
+            n_tag_sites=n, n_agree=int(n_agree),
+            epsilon=eps, background_rate=background_rate,
+            p_noise=p_noise, bleed_through=bleed_through,
+            delta_misassign=(int(delta_misassign)
+                             if not np.isnan(delta_misassign) else np.nan),
+            p_misassign=p_misassign, p_false_positive=p_fp,
+            is_mutated=(p_fp < p_threshold),
+            snp_phased=snp_phased, confidence_tier=tier,
+        ))
+
+    tested_rows = [
+        dict(ins_key=ins_key, a_key=at[0], t_key=at[1],
+             ref_length=ref_lengths.get(at, np.nan),
+             n_cells_tested=n_c, confidence_tier=tier)
+        for at, n_c in cell_counts_per_at.items()
+    ]
+    return mutation_rows, tested_rows
+
+
+def call_mutations(histogram_dfs, allele_calls, noise_fn,
+                   peak_based_calling=None, phase_allele_snv_dict=None,
+                   value_key='hist_peak', min_tag_sites=2, p_threshold=0.05,
+                   n_jobs=1):
+    """
+    Call somatic polyA tract mutations per cell.
+
+    For each (cell, insertion, allele, tract) with >= min_tag_sites independent
+    tagmentation-site observations, tests whether the consensus called length
+    differs from the population reference (germline modal) length with a combined
+    false-positive probability below p_threshold.
+
+    False-positive probability is the sum of two terms (union bound):
+      p_noise      -- P(>=n_agree of n_tag_sites observations all call L_mut by
+                       measurement noise alone), computed as a one-sided binomial
+                       test with rate epsilon = noise_fn(ref_length).
+      p_misassign  -- delta * I(|L_cell - L_ref_B| <= 1), where delta is the
+                       allele bleed-through rate (conditional_prob from allele_calls)
+                       and L_ref_B is the other allele's reference length.  This
+                       flags the worst-case scenario: the apparent mutation matches
+                       the other allele's length AND the bleed-through rate is high
+                       enough to explain it with a single mis-assigned tag site.
+                       For SNP-phased insertions the allele assignment is validated
+                       independently, so p_misassign is set to zero.
+
+    Parameters
+    ----------
+    histogram_dfs : dict {ins_key: histogram_df}
+    allele_calls  : dict {ins_key: {seq_key: {'fraction_tags', 'conditional_probs'}}}
+    noise_fn      : callable  epsilon(L) returned by build_noise_model
+    peak_based_calling : dict, optional  {ins_key: (boundaries_dict, ...)}
+    phase_allele_snv_dict : dict, optional  {ins_key: {pos: (counts, chi2, p, ...)}}
+    value_key     : str  'hist_peak' (default) or 'kd_allele'
+    min_tag_sites : int  minimum independent observations required to make a call
+    p_threshold   : float  p_false_positive < p_threshold to call is_mutated=True
+
+    Returns
+    -------
+    mutations : pd.DataFrame
+        One row per (cell, insertion, allele, tract) where the cell's consensus
+        length differs from the population reference.  Indexed by
+        (ins_key, cell, a_key, t_key).  Columns:
+
+        ref_length       int   population modal length (germline estimate)
+        cell_length      int   this cell's consensus across tag sites
+        delta_length     int   cell_length - ref_length
+        n_tag_sites      int   total independent observations for this cell
+        n_agree          int   observations agreeing on cell_length
+        epsilon          float noise_fn(ref_length) — global per-observation error rate
+        background_rate  float max(epsilon, population frequency of cell_length):
+                               the empirical rate at which cell_length is observed
+                               across all cells at this insertion/allele/tract.
+                               Using the maximum of epsilon and the empirical frequency
+                               is key for correctly penalising ±1 calls at noisy tracts,
+                               where the kd-tree's nearest-neighbour noise concentrates
+                               on adjacent lengths that therefore appear frequently
+                               even without any true mutation.
+        p_noise          float binomial P(>=n_agree of n_tag_sites call cell_length
+                               by chance) using background_rate as the per-obs rate
+        bleed_through    float conditional_prob delta for this allele direction
+                               (NaN for homozygous / peak-based insertions)
+        delta_misassign  int   |cell_length - other_allele_ref_length|
+                               (NaN when no other allele is identified)
+        p_misassign      float delta * I(delta_misassign <= 1), 0.0 if SNP-phased
+        p_false_positive float p_noise + p_misassign (union bound), capped at 1
+        is_mutated       bool  delta_length != 0 AND p_false_positive < p_threshold
+        snp_phased       bool  insertion has at least one SNP-phasing site p<0.05
+        confidence_tier  int   1 SNP-phased; 2 clean sequence (delta<1%);
+                               3 noisy sequence (delta>=1%); 4 biallelic-peak;
+                               5 homozygous single-allele
+
+    tested_cells : pd.DataFrame
+        Per (ins_key, a_key, t_key): n_cells_tested (cells with >=min_tag_sites
+        observations).  Use as the denominator for mutation rates.
+    """
+    from scipy.stats import binom as _binom
+
+    if peak_based_calling is None:
+        peak_based_calling = {}
+    if phase_allele_snv_dict is None:
+        phase_allele_snv_dict = {}
+
+    # Insertions with at least one significant SNP-phasing site (p < 0.05)
+    snp_phased_ins = {
+        ins_key
+        for ins_key, sites in phase_allele_snv_dict.items()
+        if any(entry[2] is not None and entry[2] < 0.05 for entry in sites.values())
+    }
+
+    from joblib import Parallel, delayed as _delayed
+
+    par_results = Parallel(n_jobs=n_jobs)(
+        _delayed(_mutations_one_ins)(
+            ins_key, histogram_df,
+            biallele_result=peak_based_calling.get(ins_key),
+            ac=allele_calls.get(ins_key, {}),
+            snp_phased=(ins_key in snp_phased_ins),
+            noise_fn=noise_fn,
+            min_tag_sites=min_tag_sites,
+            p_threshold=p_threshold,
+            value_key=value_key,
+        )
+        for ins_key, histogram_df in histogram_dfs.items()
+    )
+
+    mutation_rows = []
+    tested_rows = []
+    for mut_r, test_r in par_results:
+        mutation_rows.extend(mut_r)
+        tested_rows.extend(test_r)
+
+    if not mutation_rows:
+        mutations = pd.DataFrame(columns=[
+            'ref_length', 'cell_length', 'delta_length', 'n_tag_sites', 'n_agree',
+            'epsilon', 'background_rate', 'p_noise', 'bleed_through',
+            'delta_misassign', 'p_misassign', 'p_false_positive',
+            'is_mutated', 'snp_phased', 'confidence_tier',
+        ]).rename_axis(index=['ins_key', 'cell', 'a_key', 't_key'])
+    else:
+        mutations = (pd.DataFrame(mutation_rows)
+                     .set_index(['ins_key', 'cell', 'a_key', 't_key']))
+
+    tested_cells = (pd.DataFrame(tested_rows)
+                    .set_index(['ins_key', 'a_key', 't_key'])
+                    if tested_rows else pd.DataFrame())
+
+    return mutations, tested_cells
+
+
+# ── Cross-tract consistency ──────────────────────────────────────────────────
+
+def _cross_tract_pass1_one_ins(ins_key, df, value_key, min_tag_sites, biallele_result):
+    """
+    Pass-1 worker for add_cross_tract_consistency (one insertion).
+    Returns (ins_key, ref_lengths_dict, tested_df or None).
+    """
+    df_r = df.reset_index()
+    if value_key not in df_r.columns or df_r[value_key].isna().all():
+        return ins_key, {}, None
+    if biallele_result is not None:
+        df_split = _assign_biallelic_a_key(df_r, biallele_result)
+        if df_split is not None:
+            df_r = df_split
+    df_r = df_r[df_r[value_key].notna()]
+    if df_r.empty:
+        return ins_key, {}, None
+    ref_lengths = _reference_lengths(df_r, value_key)
+    obs = (df_r.groupby(['cell', 'a_key', 't_key'])['tag_site']
+           .count()
+           .reset_index(name='_n'))
+    tested = obs.loc[obs['_n'] >= min_tag_sites, ['cell', 'a_key', 't_key']].copy()
+    if tested.empty:
+        return ins_key, ref_lengths, None
+    tested['ins_key'] = ins_key
+    return ins_key, ref_lengths, tested
+
+
+def add_cross_tract_consistency(mutations, histogram_dfs,
+                                 peak_based_calling=None,
+                                 value_key='hist_peak',
+                                 min_tag_sites=2,
+                                 n_jobs=1):
+    """
+    Annotate mutation candidates with cross-tract consistency metrics.
+
+    For a multi-tract insertion a genuine somatic mutation changes exactly
+    one polyA tract.  Simultaneous non-reference calls at multiple tracts
+    within the same cell are therefore suspicious:
+
+      misassign_pattern  All tested tracts are non-reference AND every
+                         cell_length lies within 1 unit of the other allele's
+                         reference at that tract.  This is the canonical signal
+                         of a read set that has been assigned to the wrong allele
+                         (all tracts shift toward the other allele at once).
+
+      is_isolated        Exactly one tested tract is non-reference while all
+                         others match the reference.  The most credible
+                         single-mutation signature; noise and mis-assignment
+                         would have to affect multiple tracts independently.
+
+      frac_nonref        n_nonref_tracts / n_tested_tracts.  High values at
+                         multi-tract insertions indicate noise or mis-assignment
+                         rather than a single-locus mutation.
+
+    For single-tract insertions n_tested_tracts == 1 and is_isolated is
+    trivially True — these cells cannot benefit from cross-tract evidence.
+    Filter by n_tested_tracts >= 2 to use only informative cases.
+
+    Parameters
+    ----------
+    mutations : pd.DataFrame
+        Output of call_mutations, indexed by (ins_key, cell, a_key, t_key).
+    histogram_dfs : dict {ins_key: histogram_df}
+    peak_based_calling : dict, optional  {ins_key: (boundaries_dict, ...)}
+    value_key : str
+    min_tag_sites : int  must match the value used in call_mutations
+
+    Returns
+    -------
+    pd.DataFrame  mutations with six extra columns added:
+        n_tested_tracts   int   tracts where this cell had >= min_tag_sites obs
+        n_nonref_tracts   int   tracts where cell_length != ref_length
+        frac_nonref       float n_nonref_tracts / n_tested_tracts
+        is_isolated       bool  n_nonref==1 and n_tested>=2
+        all_toward_other  bool  every non-ref call is within 1 of the other
+                                allele's reference length at that tract
+        misassign_pattern bool  n_nonref==n_tested>=2 and all_toward_other
+    """
+    if peak_based_calling is None:
+        peak_based_calling = {}
+
+    from joblib import Parallel, delayed as _delayed
+
+    # ── Pass 1 (parallel): reference lengths and tested-tract membership ─────
+    pass1_results = Parallel(n_jobs=n_jobs)(
+        _delayed(_cross_tract_pass1_one_ins)(
+            ins_key, df, value_key, min_tag_sites,
+            peak_based_calling.get(ins_key),
+        )
+        for ins_key, df in histogram_dfs.items()
+    )
+
+    ins_ref_lengths = {}
+    tested_parts = []
+    for ins_key, ref_lengths, tested in pass1_results:
+        if ref_lengths:
+            ins_ref_lengths[ins_key] = ref_lengths
+        if tested is not None:
+            tested_parts.append(tested)
+
+    if not tested_parts:
+        return mutations
+
+    # n_tested_tracts per (ins_key, cell, a_key)
+    all_tested = pd.concat(tested_parts, ignore_index=True)
+    all_tested['a_key'] = all_tested['a_key'].astype(int)
+    all_tested['t_key'] = all_tested['t_key'].astype(int)
+    n_tested_df = (all_tested.groupby(['ins_key', 'cell', 'a_key'])['t_key']
+                   .count()
+                   .rename('n_tested_tracts')
+                   .reset_index())
+
+    # ── Build lookup: (ins_key, a_key, t_key) → other-allele reference ──────
+    # other_ref_L is the population modal length of the opposite allele at
+    # the same tract — used to detect the mis-assignment pattern.
+    lookup_rows = []
+    for ins_key, ref_map in ins_ref_lengths.items():
+        for (a_key, t_key), ref_L in ref_map.items():
+            other_a = 1 - a_key
+            lookup_rows.append({
+                'ins_key': ins_key,
+                'a_key': a_key,
+                't_key': t_key,
+                'other_ref_L': ref_map.get((other_a, t_key), np.nan),
+            })
+    lookup_df = pd.DataFrame(lookup_rows)
+
+    # ── Pass 2: per-(ins_key, cell, a_key) metrics from mutations ───────────
+    m = mutations.reset_index().copy()
+    m['a_key'] = m['a_key'].astype(int)
+    m['t_key'] = m['t_key'].astype(int)
+    m['cell_length'] = m['cell_length'].astype(int)
+
+    # Attach other-allele reference via vectorised merge (no row-by-row apply)
+    m = m.merge(lookup_df, on=['ins_key', 'a_key', 't_key'], how='left')
+    m['toward_other'] = (
+        m['other_ref_L'].notna() &
+        ((m['cell_length'] - m['other_ref_L']).abs() <= 1)
+    )
+
+    # Aggregate per (ins_key, cell, a_key)
+    per_ica = (m.groupby(['ins_key', 'cell', 'a_key'])
+               .agg(
+                   n_nonref_tracts=('t_key', 'count'),
+                   all_toward_other=('toward_other', 'all'),
+               )
+               .reset_index())
+
+    per_ica = per_ica.merge(n_tested_df, on=['ins_key', 'cell', 'a_key'], how='left')
+    # Fallback: if a cell appears in mutations but not in tested_parts
+    # (shouldn't happen), use n_nonref as the denominator.
+    per_ica['n_tested_tracts'] = per_ica['n_tested_tracts'].fillna(
+        per_ica['n_nonref_tracts'])
+    per_ica['frac_nonref'] = (per_ica['n_nonref_tracts']
+                               / per_ica['n_tested_tracts'].replace(0, np.nan))
+    per_ica['is_isolated'] = (
+        (per_ica['n_nonref_tracts'] == 1) &
+        (per_ica['n_tested_tracts'] >= 2)
+    )
+    per_ica['misassign_pattern'] = (
+        (per_ica['n_nonref_tracts'] == per_ica['n_tested_tracts']) &
+        (per_ica['n_tested_tracts'] >= 2) &
+        per_ica['all_toward_other']
+    )
+
+    # ── Join metrics back to every row in mutations ──────────────────────────
+    new_cols = ['ins_key', 'cell', 'a_key',
+                'n_tested_tracts', 'n_nonref_tracts', 'frac_nonref',
+                'is_isolated', 'all_toward_other', 'misassign_pattern']
+    m = m.drop(columns=['other_ref_L', 'toward_other'])
+    m = m.merge(per_ica[new_cols], on=['ins_key', 'cell', 'a_key'], how='left')
+    return m.set_index(['ins_key', 'cell', 'a_key', 't_key'])
 
