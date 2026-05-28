@@ -1,7 +1,7 @@
 # polyA2
 
 Pipeline for calling allelic variants and polyA tract lengths from single-cell
-BAM data.
+LUSTRE data.
 
 ## Installation
 
