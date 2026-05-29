@@ -65,36 +65,39 @@ import pandas as pd
 from scipy import stats as _stats
 
 # ── Locate support libraries ──────────────────────────────────────────────────
-# This script lives inside the polyA2 package directory alongside
-# support_functions.py.  clone_consistency_analysis.py is discovered
-# automatically: CCA_DIR env var > current working directory > this directory.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
-_CCA_FNAME = 'clone_consistency_analysis.py'
-for _d in [os.environ.get('CCA_DIR', ''), os.getcwd(), _HERE]:
-    if _d and os.path.isfile(os.path.join(_d, _CCA_FNAME)):
-        _d = os.path.abspath(_d)
-        if _d not in sys.path:
-            sys.path.insert(0, _d)
-        break
-
 from support_functions import build_noise_model, call_mutations, add_cross_tract_consistency
+from polyA_functions import (
+    make_output_dir,
+    compute_tested_tracts_per_cell,
+    compute_epsilon_weighted_denominator,
+    compute_per_cell_noise_corrected,
+    add_snp_concordance,
+    fig_noise_model,
+    fig_per_sample_rates,
+    fig_timeseries,
+    fig_allele_tiers,
+    fig_cross_tract,
+    fig_coverage,
+    fig_pvalue_exploration,
+    fig_snp_concordance,
+    fig_lenadj_rate,
+)
 
+# Clone-specific functions — only needed when a clone map is provided.
 try:
-    import clone_consistency_analysis as _cca
     from clone_consistency_analysis import (
-        make_output_dir,
-        compute_tested_tracts_per_cell,
-        compute_epsilon_weighted_denominator,
-        compute_per_cell_noise_corrected,
-        add_snp_concordance,
         clone_size_breakdown,
         fit_calibrated_fpr,
         annotate_clone_consistency,
         clone_cell_counts_from_histograms,
         summarise_clone_consistency,
         add_clone_pvalue,
+        fig_clone_calibration,
+        fig_clone_mutations,
+        fig_fpr_calibration,
     )
     _HAS_CCA = True
 except ImportError:
@@ -340,7 +343,7 @@ def main():
         mutations, histogram_dfs,
         peak_based_calling=peak_based or {}, n_jobs=n_jobs)
 
-    if have_snp and _HAS_CCA:
+    if have_snp:
         print('Annotating SNP concordance ...')
         mutations = add_snp_concordance(
             mutations,
@@ -348,11 +351,6 @@ def main():
             phase_biallele_snv or {})
 
     # ── Per-cell denominators ─────────────────────────────────────────────────
-    if not _HAS_CCA:
-        sys.exit('ERROR: clone_consistency_analysis.py not found. '
-                 'Either run from its directory, or set: '
-                 'CCA_DIR=/path/to/analysis python3 polyA_analysis.py ...')
-
     print(f'Computing tested-tract denominator (n_jobs={n_jobs}) ...')
     tested_tracts = compute_tested_tracts_per_cell(
         histogram_dfs, peak_based_calling=peak_based or {}, n_jobs=n_jobs)
@@ -523,45 +521,45 @@ def main():
             print(f'    {name}.pdf  FAILED: {exc}')
 
     _try('fig1_noise_model',
-         lambda: _cca.fig_noise_model(noise_df, out_dir))
+         lambda: fig_noise_model(noise_df, out_dir))
 
     if have_clone and breakdown:
         _try('fig2_clone_calibration',
-             lambda: _cca.fig_clone_calibration(breakdown, calibrated_fpr, out_dir))
+             lambda: fig_clone_calibration(breakdown, calibrated_fpr, out_dir))
 
     if have_sample and not sample_summary.empty:
         _try('fig3_per_sample_rates',
-             lambda: _cca.fig_per_sample_rates(sample_summary, per_cell, out_dir))
+             lambda: fig_per_sample_rates(sample_summary, per_cell, out_dir))
         if not ts.empty:
             _try('fig4_timeseries',
-                 lambda: _cca.fig_timeseries(ts, tp_stats, ts_cells, out_dir))
+                 lambda: fig_timeseries(ts, tp_stats, ts_cells, out_dir))
             _try('ed7_lenadj_rate',
-                 lambda: _cca.fig_lenadj_rate(ts, sample_summary, out_dir))
+                 lambda: fig_lenadj_rate(ts, sample_summary, out_dir))
 
     if have_clone and clone_mut is not None:
         _try('fig5_clone_mutations',
-             lambda: _cca.fig_clone_mutations(clone_mut, out_dir))
+             lambda: fig_clone_mutations(clone_mut, out_dir))
 
     _try('ed1_allele_tiers',
-         lambda: _cca.fig_allele_tiers(mutations, allele_calls, out_dir))
+         lambda: fig_allele_tiers(mutations, allele_calls, out_dir))
     _try('ed2_cross_tract',
-         lambda: _cca.fig_cross_tract(annotated, out_dir))
+         lambda: fig_cross_tract(annotated, out_dir))
 
     if have_sample and not sample_summary.empty:
         _try('ed3_coverage',
-             lambda: _cca.fig_coverage(per_cell, sample_summary, MIN_TESTED, out_dir))
+             lambda: fig_coverage(per_cell, sample_summary, MIN_TESTED, out_dir))
 
     if have_clone and breakdown:
         _try('ed4_fpr_calibration',
-             lambda: _cca.fig_fpr_calibration(breakdown, calibrated_fpr, summary, out_dir))
+             lambda: fig_fpr_calibration(breakdown, calibrated_fpr, summary, out_dir))
 
     if regression_rows:
         _try('ed5_pvalue_exploration',
-             lambda: _cca.fig_pvalue_exploration(regression_rows, out_dir))
+             lambda: fig_pvalue_exploration(regression_rows, out_dir))
 
     if have_snp:
         _try('ed6_snp_concordance',
-             lambda: _cca.fig_snp_concordance(
+             lambda: fig_snp_concordance(
                  phase_allele_snv or {}, phase_biallele_snv or {},
                  allele_calls, out_dir))
 
