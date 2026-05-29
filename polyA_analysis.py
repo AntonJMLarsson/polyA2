@@ -212,14 +212,23 @@ def load_rna_clone_map(clone_path, samplesheet_path):
                  .assign(clone_group=matched['Clone_ID'].astype(str).map(clone_id_to_int))
                  .set_index('dna_bc')['clone_group'].astype(int).to_dict())
 
-    sample_map = (matched[['dna_bc', 'celltype']]
-                  .rename(columns={'celltype': 'cell_type'})
-                  .assign(sample=matched['celltype'].values,
-                          time_point=np.nan,
-                          donor=None,
-                          is_timeseries=False)
-                  .set_index('dna_bc')
-                  .rename_axis('cell_barcode'))
+    # sample_map covers ALL DNA cells in the samplesheet (not just those in the clone file)
+    # Use the samplesheet Sample column as the grouping
+    if 'Sample' not in ss.columns:
+        raise ValueError("--samplesheet must have a 'Sample' column for per-sample grouping")
+    dna_all = _reset_bc(ss[ss['Modality'] == 'DNA'][['Sample']], 'cell_barcode')
+    donor_col = ss['Donor'] if 'Donor' in ss.columns else None
+    if donor_col is not None:
+        dna_all = _reset_bc(ss[ss['Modality'] == 'DNA'][['Sample', 'Donor']], 'cell_barcode')
+        sample_map = (dna_all.rename(columns={'Sample': 'sample', 'Donor': 'donor'})
+                      .assign(cell_type=dna_all['Sample'].values,
+                              time_point=np.nan, is_timeseries=False)
+                      .set_index('cell_barcode'))
+    else:
+        sample_map = (dna_all.rename(columns={'Sample': 'sample'})
+                      .assign(cell_type=dna_all['Sample'].values,
+                              time_point=np.nan, donor=None, is_timeseries=False)
+                      .set_index('cell_barcode'))
 
     return clone_map, sample_map, clone_id_legend
 
