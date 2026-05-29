@@ -66,10 +66,18 @@ from scipy import stats as _stats
 
 # ── Locate support libraries ──────────────────────────────────────────────────
 # This script lives inside the polyA2 package directory alongside
-# support_functions.py.  A caller that has a separate clone_consistency_analysis
-# module should add its directory to PYTHONPATH or pass --clone-analysis-dir.
+# support_functions.py.  clone_consistency_analysis.py is discovered
+# automatically: CCA_DIR env var > current working directory > this directory.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
+
+_CCA_FNAME = 'clone_consistency_analysis.py'
+for _d in [os.environ.get('CCA_DIR', ''), os.getcwd(), _HERE]:
+    if _d and os.path.isfile(os.path.join(_d, _CCA_FNAME)):
+        _d = os.path.abspath(_d)
+        if _d not in sys.path:
+            sys.path.insert(0, _d)
+        break
 
 from support_functions import build_noise_model, call_mutations, add_cross_tract_consistency
 
@@ -341,8 +349,9 @@ def main():
 
     # ── Per-cell denominators ─────────────────────────────────────────────────
     if not _HAS_CCA:
-        sys.exit('ERROR: clone_consistency_analysis not found on PYTHONPATH. '
-                 'Add its directory with: PYTHONPATH=/path/to/analysis python3 polyA_analysis.py ...')
+        sys.exit('ERROR: clone_consistency_analysis.py not found. '
+                 'Either run from its directory, or set: '
+                 'CCA_DIR=/path/to/analysis python3 polyA_analysis.py ...')
 
     print(f'Computing tested-tract denominator (n_jobs={n_jobs}) ...')
     tested_tracts = compute_tested_tracts_per_cell(
@@ -430,6 +439,7 @@ def main():
         print('\n=== Per-sample summary ===')
         per_cell['cell'] = per_cell['cell'].astype(str)
         sample_summary = summarise_by_sample_general(per_cell, sample_map)
+        per_cell = per_cell.join(sample_map[['sample']], on='cell', how='left')
         print(sample_summary[['sample','n_cells','mean_mutation_rate',
                                'se_mutation_rate']].to_string(index=False))
 
