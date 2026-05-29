@@ -170,23 +170,37 @@ def load_rna_clone_map(clone_path, samplesheet_path):
                  (sample = celltype, time_point = NaN, is_timeseries = False)
     clone_id_legend : dict {clone_group_int: original_Clone_ID_str}
     """
-    cf = pd.read_csv(clone_path, index_col=0)
+    cf = pd.read_csv(clone_path)
+    # Drop leading unnamed index column (produced when a DataFrame is saved with default index)
+    if cf.columns[0].startswith('Unnamed') or cf.columns[0] == '':
+        cf = cf.iloc[:, 1:]
+    # Deduplicate column names (e.g. Cell_ID appearing twice), keeping first occurrence
+    cf = cf.loc[:, ~cf.columns.duplicated(keep='first')]
     required = {'Cell_ID', 'Clone_ID', 'celltype'}
     if not required.issubset(cf.columns):
         raise ValueError(f"--rna-clone-map must have columns: {required}")
 
     ss = pd.read_csv(samplesheet_path, index_col=0)
+    # Drop duplicate first column (some samplesheets have the barcode column twice)
+    ss = ss.loc[:, ~ss.columns.duplicated(keep='first')]
     if not {'Modality', 'Plate_code', 'WellID'}.issubset(ss.columns):
         raise ValueError("--samplesheet must have columns: Modality, Plate_code, WellID")
 
-    dna = (ss[ss['Modality'] == 'DNA'][['Plate_code', 'WellID']]
-           .reset_index().rename(columns={'index': 'dna_bc'}))
-    rna = (ss[ss['Modality'] == 'RNA'][['Plate_code', 'WellID']]
-           .reset_index().rename(columns={'index': 'rna_bc'}))
+    def _reset_bc(df, new_name):
+        df = df.reset_index()
+        df = df.rename(columns={df.columns[0]: new_name})
+        return df
+
+    dna = _reset_bc(ss[ss['Modality'] == 'DNA'][['Plate_code', 'WellID']], 'dna_bc')
+    rna = _reset_bc(ss[ss['Modality'] == 'RNA'][['Plate_code', 'WellID']], 'rna_bc')
     rna_to_dna = (dna.merge(rna, on=['Plate_code', 'WellID'])
                   .set_index('rna_bc')['dna_bc'].to_dict())
 
-    cf['dna_bc'] = cf['Cell_ID'].map(rna_to_dna)
+    cell_ids = cf['Cell_ID']
+    # If samplesheet barcodes don't carry the sample prefix (e.g. 'FL3_'), strip it
+    if not cell_ids.isin(rna_to_dna).any():
+        cell_ids = cell_ids.str.replace(r'^[^_]+_', '', regex=True)
+    cf['dna_bc'] = cell_ids.map(rna_to_dna)
     matched = cf.dropna(subset=['dna_bc'])
 
     # Encode Clone_ID strings → stable integers

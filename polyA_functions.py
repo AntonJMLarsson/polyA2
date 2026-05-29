@@ -1102,6 +1102,8 @@ def fig_clone_calibration(breakdown, calibrated_fpr, out_dir):
 
 
 def fig_clone_mutations(clone_mut, out_dir):
+    if clone_mut.empty:
+        return
     cm = clone_mut.copy()
     p_col = 'p_fisher' if 'p_fisher' in cm.columns else 'p_clone_noise'
     cm['log10_p'] = -np.log10(cm[p_col].clip(lower=1e-10))
