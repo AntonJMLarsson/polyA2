@@ -75,6 +75,12 @@ from polyA_functions import (
     compute_epsilon_weighted_denominator,
     compute_per_cell_noise_corrected,
     add_snp_concordance,
+    clone_cell_counts_from_histograms,
+    annotate_clone_consistency,
+    summarise_clone_consistency,
+    add_clone_pvalue,
+    clone_size_breakdown,
+    fit_calibrated_fpr,
     fig_noise_model,
     fig_per_sample_rates,
     fig_timeseries,
@@ -84,24 +90,10 @@ from polyA_functions import (
     fig_pvalue_exploration,
     fig_snp_concordance,
     fig_lenadj_rate,
+    fig_clone_calibration,
+    fig_clone_mutations,
+    fig_fpr_calibration,
 )
-
-# Clone-specific functions — only needed when a clone map is provided.
-try:
-    from clone_consistency_analysis import (
-        clone_size_breakdown,
-        fit_calibrated_fpr,
-        annotate_clone_consistency,
-        clone_cell_counts_from_histograms,
-        summarise_clone_consistency,
-        add_clone_pvalue,
-        fig_clone_calibration,
-        fig_clone_mutations,
-        fig_fpr_calibration,
-    )
-    _HAS_CCA = True
-except ImportError:
-    _HAS_CCA = False
 
 
 # ── Generic data-loading helpers ─────────────────────────────────────────────
@@ -155,6 +147,67 @@ def load_sample_map(path):
     df['time_point'] = pd.to_numeric(df['time_point'], errors='coerce')
     df['is_timeseries'] = df['is_timeseries'].astype(bool)
     return df.set_index('cell_barcode')
+
+
+def load_rna_clone_map(clone_path, samplesheet_path):
+    """
+    Load a clone file with RNA barcodes and map them to DNA barcodes.
+
+    Expected columns in clone_path:
+        Cell_ID    str   RNA barcode (e.g. FL1_AACGGACTCGGTTCTAACTC)
+        Clone_ID   str   Clone identifier (mutation string or integer label)
+        celltype   str   Cell-type label
+
+    samplesheet_path: CSV with columns including Modality, Plate_code, WellID
+        and barcodes as the index.  DNA and RNA cells at the same
+        (Plate_code, WellID) are treated as the same physical cell.
+
+    Returns
+    -------
+    clone_map  : dict {dna_barcode: clone_group_int}
+    sample_map : pd.DataFrame indexed by dna_barcode with columns
+                 sample, cell_type, time_point, donor, is_timeseries
+                 (sample = celltype, time_point = NaN, is_timeseries = False)
+    clone_id_legend : dict {clone_group_int: original_Clone_ID_str}
+    """
+    cf = pd.read_csv(clone_path, index_col=0)
+    required = {'Cell_ID', 'Clone_ID', 'celltype'}
+    if not required.issubset(cf.columns):
+        raise ValueError(f"--rna-clone-map must have columns: {required}")
+
+    ss = pd.read_csv(samplesheet_path, index_col=0)
+    if not {'Modality', 'Plate_code', 'WellID'}.issubset(ss.columns):
+        raise ValueError("--samplesheet must have columns: Modality, Plate_code, WellID")
+
+    dna = (ss[ss['Modality'] == 'DNA'][['Plate_code', 'WellID']]
+           .reset_index().rename(columns={'index': 'dna_bc'}))
+    rna = (ss[ss['Modality'] == 'RNA'][['Plate_code', 'WellID']]
+           .reset_index().rename(columns={'index': 'rna_bc'}))
+    rna_to_dna = (dna.merge(rna, on=['Plate_code', 'WellID'])
+                  .set_index('rna_bc')['dna_bc'].to_dict())
+
+    cf['dna_bc'] = cf['Cell_ID'].map(rna_to_dna)
+    matched = cf.dropna(subset=['dna_bc'])
+
+    # Encode Clone_ID strings → stable integers
+    unique_clones = sorted(matched['Clone_ID'].astype(str).unique())
+    clone_id_to_int = {c: i + 1 for i, c in enumerate(unique_clones)}
+    clone_id_legend = {v: k for k, v in clone_id_to_int.items()}
+
+    clone_map = (matched[['dna_bc', 'Clone_ID']]
+                 .assign(clone_group=matched['Clone_ID'].astype(str).map(clone_id_to_int))
+                 .set_index('dna_bc')['clone_group'].astype(int).to_dict())
+
+    sample_map = (matched[['dna_bc', 'celltype']]
+                  .rename(columns={'celltype': 'cell_type'})
+                  .assign(sample=matched['celltype'].values,
+                          time_point=np.nan,
+                          donor=None,
+                          is_timeseries=False)
+                  .set_index('dna_bc')
+                  .rename_axis('cell_barcode'))
+
+    return clone_map, sample_map, clone_id_legend
 
 
 # ── Per-sample aggregation (general version) ──────────────────────────────────
@@ -269,6 +322,12 @@ def main():
                         help='Filename prefix for pickles (default: "")')
     parser.add_argument('--clone-map', default=None,
                         help='CSV: cell_barcode, clone_group  (optional)')
+    parser.add_argument('--rna-clone-map', default=None,
+                        help='CSV with Cell_ID (RNA barcode), Clone_ID, celltype. '
+                             'Requires --samplesheet for RNA→DNA barcode matching.')
+    parser.add_argument('--samplesheet', default=None,
+                        help='Samplesheet CSV (index=barcode, columns include '
+                             'Modality, Plate_code, WellID). Required with --rna-clone-map.')
     parser.add_argument('--sample-map', default=None,
                         help='CSV: cell_barcode, sample [, time_point, donor, ...] (optional)')
     parser.add_argument('--output-dir', default=None,
@@ -286,11 +345,8 @@ def main():
     if args.output_dir:
         out_dir = args.output_dir
         os.makedirs(out_dir, exist_ok=True)
-    elif _HAS_CCA:
-        out_dir = make_output_dir(explicit=None)
     else:
-        out_dir = os.path.join(os.getcwd(), datetime.now().strftime('results/%Y-%m-%d_%H-%M'))
-        os.makedirs(out_dir, exist_ok=True)
+        out_dir = make_output_dir(explicit=None)
     print(f'Output directory: {out_dir}')
 
     def _pkl(name):
@@ -317,10 +373,21 @@ def main():
     print(f'  phase_biallele_snv : {"loaded" if phase_biallele_snv else "not found"}')
 
     # ── Load optional clone / sample maps ─────────────────────────────────────
-    dna_to_clone = load_clone_map(args.clone_map)
-    sample_map   = load_sample_map(args.sample_map)
-    have_clone   = dna_to_clone is not None
-    have_sample  = sample_map is not None
+    clone_id_legend = {}
+    if args.rna_clone_map:
+        if not args.samplesheet:
+            sys.exit('ERROR: --rna-clone-map requires --samplesheet for RNA→DNA barcode matching')
+        dna_to_clone, rna_sample_map, clone_id_legend = load_rna_clone_map(
+            args.rna_clone_map, args.samplesheet)
+        # Use the derived sample map unless an explicit one was provided
+        sample_map = load_sample_map(args.sample_map) if args.sample_map else rna_sample_map
+        sample_map.index.name = 'cell_barcode'
+    else:
+        dna_to_clone = load_clone_map(args.clone_map)
+        sample_map   = load_sample_map(args.sample_map)
+
+    have_clone   = dna_to_clone is not None and len(dna_to_clone) > 0
+    have_sample  = sample_map is not None and len(sample_map) > 0
     print(f'  clone map          : {"loaded ({:,} cells)".format(len(dna_to_clone)) if have_clone else "not provided — clone analysis skipped"}')
     print(f'  sample map         : {"loaded ({:,} cells)".format(len(sample_map))   if have_sample else "not provided — per-sample analysis skipped"}')
 
@@ -507,6 +574,10 @@ def main():
         if calibrated_fpr:
             pd.DataFrame([calibrated_fpr]).to_csv(
                 os.path.join(tbl_dir, 'calibrated_fpr.csv'), index=False)
+    if clone_id_legend:
+        (pd.DataFrame({'clone_group': list(clone_id_legend.keys()),
+                       'Clone_ID':    list(clone_id_legend.values())})
+         .to_csv(os.path.join(tbl_dir, 'clone_id_legend.csv'), index=False))
 
     # ── Figures ───────────────────────────────────────────────────────────────
     print('  Generating figures ...')

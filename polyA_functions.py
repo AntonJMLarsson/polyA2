@@ -346,7 +346,12 @@ def fig_noise_model(noise_df, out_dir):
 
 def fig_per_sample_rates(sample_summary, per_cell, out_dir):
     ts_ss = sample_summary[sample_summary['is_timeseries']].copy()
-    ts_ss = ts_ss.sort_values(['time_point', 'donor', 'sample'])
+    if ts_ss.empty:
+        ts_ss = sample_summary.copy()
+        ts_ss['time_point'] = np.nan
+        ts_ss = ts_ss.sort_values('sample')
+    else:
+        ts_ss = ts_ss.sort_values(['time_point', 'donor', 'sample'])
     sample_order = ts_ss['sample'].tolist()
 
     pc_ts = per_cell[per_cell['sample'].isin(sample_order)].copy()
@@ -597,8 +602,13 @@ def fig_coverage(per_cell, sample_summary, min_tested, out_dir):
                  fontweight='bold')
 
     ax = axes[1]
-    ts_ss = sample_summary[sample_summary['is_timeseries']].sort_values(
-        ['time_point', 'donor'])
+    ts_ss = sample_summary[sample_summary['is_timeseries']].copy()
+    if ts_ss.empty:
+        ts_ss = sample_summary.copy()
+        ts_ss['time_point'] = np.nan
+        ts_ss = ts_ss.sort_values('sample')
+    else:
+        ts_ss = ts_ss.sort_values(['time_point', 'donor'])
     ts_cells_pc = per_cell[per_cell['sample'].isin(ts_ss['sample'])].copy()
     ts_cells_pc = ts_cells_pc.merge(
         ts_ss[['sample', 'time_point']], on='sample', how='left')
@@ -846,3 +856,337 @@ def fig_lenadj_rate(ts, sample_summary, out_dir):
 
     fig.tight_layout(pad=0.8)
     _savefig(fig, os.path.join(out_dir, 'figures', 'ed7_lenadj_rate.pdf'))
+
+
+# ── Clone analysis functions ──────────────────────────────────────────────────
+
+def _clone_counts_one_ins(ins_key, df, dna_to_clone, value_key, min_tag_sites):
+    """Worker for clone_cell_counts_from_histograms (one insertion)."""
+    df_r = df.reset_index()
+    if value_key in df_r.columns:
+        df_r = df_r[df_r[value_key].notna()]
+    df_r['clone_group'] = df_r['cell'].map(dna_to_clone)
+    df_r = df_r[df_r['clone_group'].notna()]
+    if df_r.empty:
+        return {}
+    obs = (df_r.groupby(['cell', 'a_key', 't_key', 'clone_group'])['tag_site']
+           .count()
+           .reset_index(name='n_obs'))
+    obs = obs[obs['n_obs'] >= min_tag_sites]
+    counts = {}
+    for _, row in obs.iterrows():
+        key = (ins_key, int(row['a_key']), int(row['t_key']), int(row['clone_group']))
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def clone_cell_counts_from_histograms(histogram_dfs, dna_to_clone,
+                                      min_tag_sites=2, value_key='hist_peak',
+                                      n_jobs=1):
+    """
+    Count, for each (ins_key, a_key, t_key, clone_group), how many cells have
+    >= min_tag_sites valid observations.
+    Returns dict {(ins_key, a_key, t_key, clone_group): n_cells}.
+    """
+    from joblib import Parallel, delayed as _delayed
+
+    results = Parallel(n_jobs=n_jobs)(
+        _delayed(_clone_counts_one_ins)(ins_key, df, dna_to_clone, value_key, min_tag_sites)
+        for ins_key, df in histogram_dfs.items()
+    )
+    counts = {}
+    for partial in results:
+        for k, v in partial.items():
+            counts[k] = counts.get(k, 0) + v
+    return counts
+
+
+def annotate_clone_consistency(mutations_df, clone_cell_counts, dna_to_clone):
+    """Add clone-level consistency columns to the mutations DataFrame."""
+    m = mutations_df.reset_index().copy()
+    m['clone_group'] = m['cell'].map(dna_to_clone).astype('Int64')
+
+    with_clone = m[m['clone_group'].notna()].copy()
+    grp_cols = ['ins_key', 'a_key', 't_key', 'clone_group', 'cell_length']
+    agg = (with_clone.groupby(grp_cols)
+           .agg(n_clone_calling=('cell', 'count'),
+                n_clone_is_mutated=('is_mutated', 'sum'))
+           .reset_index())
+    m = m.merge(agg, on=grp_cols, how='left')
+
+    def _lookup_clone_total(row):
+        if pd.isna(row['clone_group']):
+            return np.nan
+        return clone_cell_counts.get(
+            (row['ins_key'], int(row['a_key']), int(row['t_key']), int(row['clone_group'])), 0)
+
+    m['n_clone_cells']  = m.apply(_lookup_clone_total, axis=1)
+    m['clone_fraction'] = m['n_clone_calling'] / m['n_clone_cells'].replace(0, np.nan)
+    m['all_agree']      = m['n_clone_calling'] == m['n_clone_cells']
+    return m.set_index(['ins_key', 'cell', 'a_key', 't_key'])
+
+
+def summarise_clone_consistency(annotated, min_clone_size=2):
+    """Summary statistics per delta_bucket for calibration."""
+    df = annotated.reset_index()
+    df['delta_bucket'] = df['delta_length'].abs().apply(
+        lambda d: '±1' if d == 1 else ('±2' if d == 2 else '|Δ|≥3'))
+
+    rows = []
+    for bucket, grp in df.groupby('delta_bucket'):
+        with_clone = grp[grp['clone_group'].notna()]
+        sizege2 = with_clone[with_clone['n_clone_cells'] >= min_clone_size]
+        rows.append(dict(
+            delta_bucket=bucket,
+            n_candidates=len(grp),
+            n_is_mutated=grp['is_mutated'].sum(),
+            n_with_clone=len(with_clone),
+            n_clone_size_ge2=len(sizege2),
+            n_all_agree=sizege2['all_agree'].sum(),
+            frac_all_agree=(sizege2['all_agree'].mean() if len(sizege2) > 0 else np.nan),
+        ))
+    summary = pd.DataFrame(rows).set_index('delta_bucket')
+
+    grp_cols = ['ins_key', 'a_key', 't_key', 'clone_group', 'cell_length']
+    clone_mut = (
+        df[df['clone_group'].notna()]
+        .groupby(grp_cols)
+        .agg(
+            ref_length=('ref_length', 'first'),
+            delta_length=('delta_length', 'first'),
+            delta_bucket=('delta_bucket', 'first'),
+            n_clone_cells=('n_clone_cells', 'first'),
+            n_clone_calling=('n_clone_calling', 'first'),
+            n_clone_is_mutated=('n_clone_is_mutated', 'first'),
+            clone_fraction=('clone_fraction', 'first'),
+            all_agree=('all_agree', 'first'),
+            min_p_fp=('p_false_positive', 'min'),
+            epsilon=('epsilon', 'first'),
+            background_rate=('background_rate', 'first'),
+            confidence_tier=('confidence_tier', 'first'),
+            snp_concordance=('snp_concordance', 'first'),
+            snp_concordance_p=('snp_concordance_p', 'first'),
+            snp_concordance_low=('snp_concordance_low', 'first'),
+        )
+        .reset_index()
+    )
+    return summary, clone_mut
+
+
+def add_clone_pvalue(clone_mut, annotated, tested_cells):
+    """Fisher's exact test for clone enrichment of L_mut with BH-FDR correction."""
+    from scipy.stats import fisher_exact as _fisher_exact
+    from statsmodels.stats.multitest import multipletests as _mct
+
+    df = clone_mut.copy()
+    df['cell_length'] = df['cell_length'].astype(int)
+
+    ann_r = annotated.reset_index()
+    ann_r['cell_length'] = ann_r['cell_length'].astype(int)
+    K_df = (ann_r.groupby(['ins_key', 'a_key', 't_key', 'cell_length'])['cell']
+            .nunique().rename('K_calling').reset_index())
+    df = df.merge(K_df, on=['ins_key', 'a_key', 't_key', 'cell_length'], how='left')
+
+    tc = tested_cells.reset_index()[['ins_key', 'a_key', 't_key', 'n_cells_tested']]
+    tc = tc.groupby(['ins_key', 'a_key', 't_key'], as_index=False)['n_cells_tested'].max()
+    df = df.merge(tc, on=['ins_key', 'a_key', 't_key'], how='left')
+    df = df.rename(columns={'n_cells_tested': 'N_tested'})
+
+    df['K_outside'] = (df['K_calling'] - df['n_clone_calling']).clip(lower=0)
+    df['N_outside'] = (df['N_tested']  - df['n_clone_cells']).clip(lower=0)
+
+    def _run_fisher(k, n_clone, K_out, N_out):
+        n_clone_other = int(n_clone) - int(k)
+        N_out_other   = int(N_out)   - int(K_out)
+        if n_clone_other < 0 or N_out_other < 0:
+            return np.nan, np.nan
+        try:
+            odds, p = _fisher_exact([[int(k), n_clone_other],
+                                      [int(K_out), N_out_other]], alternative='greater')
+            return float(odds), float(p)
+        except Exception:
+            return np.nan, np.nan
+
+    results = [_run_fisher(k, n, Ko, No)
+               for k, n, Ko, No in zip(df['n_clone_calling'], df['n_clone_cells'],
+                                        df['K_outside'], df['N_outside'])]
+    df['odds_ratio'] = [r[0] for r in results]
+    df['p_fisher']   = [r[1] for r in results]
+
+    valid_mask = df['p_fisher'].notna()
+    q_vals = np.full(len(df), np.nan)
+    if valid_mask.any():
+        _, q_adj, _, _ = _mct(df.loc[valid_mask, 'p_fisher'].values, alpha=0.05, method='fdr_bh')
+        q_vals[valid_mask.values] = q_adj
+    df['q_fisher'] = q_vals
+
+    df['K_rate_outside'] = df['K_outside'] / df['N_outside'].replace(0, np.nan)
+    max_nonclone_rate = df['epsilon'].clip(upper=0.10)
+    df['p_clone_noise'] = df['background_rate'] ** df['n_clone_calling']
+    df['is_clone_mutated'] = (
+        (df['clone_fraction'] >= 0.9) &
+        (df['n_clone_calling'] >= 2) &
+        (df['q_fisher'] < 0.05) &
+        (df['K_rate_outside'] <= max_nonclone_rate)
+    )
+    return df
+
+
+def clone_size_breakdown(annotated, min_clone_cells=2):
+    """Per-delta-bucket all_agree rate by clone size for geometric FPR fitting."""
+    df = annotated.reset_index()
+    df['delta_bucket'] = df['delta_length'].abs().apply(
+        lambda d: '±1' if d == 1 else ('±2' if d == 2 else '|Δ|≥3'))
+    breakdown = {}
+    for bucket, grp in df.groupby('delta_bucket'):
+        has_clone = grp[grp['clone_group'].notna() & (grp['n_clone_cells'] >= min_clone_cells)]
+        by_size = (has_clone.groupby('n_clone_cells')['all_agree']
+                   .agg(n_all_agree='sum', n_total='count')
+                   .assign(rate=lambda x: x['n_all_agree'] / x['n_total']))
+        breakdown[bucket] = by_size
+    return breakdown
+
+
+def fit_calibrated_fpr(breakdown):
+    """Fit per-cell noise FPR via log-linear regression on clone-size data."""
+    from scipy import stats as _st
+    calibrated = {}
+    for bucket, by_size in breakdown.items():
+        valid = by_size[by_size['n_all_agree'] > 0].copy()
+        if len(valid) >= 2:
+            slope, *_ = _st.linregress(valid.index.values.astype(float),
+                                        np.log(valid['rate'].values))
+            p = float(np.clip(np.exp(slope), 0.0, 1.0))
+        elif len(valid) == 1:
+            k = float(valid.index[0])
+            p = float(np.clip(valid['rate'].iloc[0] ** (1.0 / k), 0.0, 1.0))
+        else:
+            if len(by_size) > 0 and by_size['n_all_agree'].sum() > 0:
+                agg_rate = by_size['n_all_agree'].sum() / by_size['n_total'].sum()
+                p = float(np.clip(agg_rate ** (1.0 / float(by_size.index.min())), 0.0, 1.0))
+            else:
+                p = 0.05
+        calibrated[bucket] = p
+    return calibrated
+
+
+# ── Clone figure functions ────────────────────────────────────────────────────
+
+def fig_clone_calibration(breakdown, calibrated_fpr, out_dir):
+    buckets = ['±1', '±2', '|Δ|≥3']
+    fig, axes = plt.subplots(1, 3, figsize=(7, 2.5), sharey=False)
+    for ax, bucket in zip(axes, buckets):
+        by_size = breakdown.get(bucket, pd.DataFrame())
+        color = BUCKET_COLORS[bucket]
+        if by_size.empty:
+            ax.set_visible(False)
+            continue
+        valid = by_size[by_size['n_all_agree'] > 0]
+        ax.scatter(valid.index, valid['rate'], s=10, color=color, zorder=3, label='Observed')
+        p_noise = calibrated_fpr.get(bucket, np.nan)
+        if not np.isnan(p_noise):
+            k_range = np.linspace(by_size.index.min(), by_size.index.max(), 200)
+            ax.plot(k_range, p_noise ** k_range, color=color, lw=1.2,
+                    label=f'p_noise^k\n(p={p_noise:.3f})')
+        ax.set_yscale('log')
+        ax.set_xlabel('Clone size k')
+        if bucket == '±1':
+            ax.set_ylabel('Fraction all-agree')
+        ax.set_title(f'{bucket}', fontsize=7, fontweight='bold')
+        ax.legend(fontsize=6, frameon=False)
+        ax.axhline(0.05, color='grey', ls='--', lw=0.6)
+    fig.suptitle('Figure 2  Clone-consistency calibration', fontsize=7,
+                 fontweight='bold', x=0.02, ha='left')
+    fig.tight_layout(pad=0.8)
+    _savefig(fig, os.path.join(out_dir, 'figures', 'fig2_clone_calibration.pdf'))
+
+
+def fig_clone_mutations(clone_mut, out_dir):
+    cm = clone_mut.copy()
+    p_col = 'p_fisher' if 'p_fisher' in cm.columns else 'p_clone_noise'
+    cm['log10_p'] = -np.log10(cm[p_col].clip(lower=1e-10))
+    cm['abs_delta'] = cm['delta_length'].abs()
+
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.5),
+                              gridspec_kw={'width_ratios': [1.1, 1]})
+    ax = axes[0]
+    tier_handles = []
+    for tier, grp in cm.groupby('confidence_tier'):
+        highlighted = grp[grp['is_clone_mutated']]
+        dimmed = grp[~grp['is_clone_mutated']]
+        color = TIER_COLORS.get(int(tier), '#aaa')
+        if not dimmed.empty:
+            ax.scatter(dimmed['abs_delta'], dimmed['log10_p'],
+                       s=dimmed['n_clone_calling'] * 8,
+                       color=color, alpha=0.20, edgecolors='none')
+        if not highlighted.empty:
+            ax.scatter(highlighted['abs_delta'], highlighted['log10_p'],
+                       s=highlighted['n_clone_calling'] * 18,
+                       color=color, alpha=0.9, edgecolors='#333', linewidths=0.5)
+            tier_handles.append(
+                Line2D([0], [0], marker='o', color='w', markerfacecolor=color,
+                       markersize=5, label=f'Tier {int(tier)}'))
+            for _, row in highlighted.iterrows():
+                ax.annotate(f"clone {int(row['clone_group'])}",
+                            xy=(row['abs_delta'], row['log10_p']),
+                            xytext=(4, 2), textcoords='offset points',
+                            fontsize=4.5, color='#333333', va='bottom')
+    ax.axhline(-np.log10(0.05), color='#e41a1c', ls='--', lw=0.8, label='p = 0.05')
+    ax.set_xlabel('|Δ length| (nt)')
+    ax.set_ylabel(f'−log₁₀({p_col})')
+    size_handles = [Line2D([0], [0], marker='o', color='w', markerfacecolor='#777',
+                            markersize=np.sqrt(n * 18), alpha=0.7, label=f'n = {n}')
+                    for n in [2, 3, 4]]
+    ax.legend(handles=tier_handles + size_handles +
+              [Line2D([0], [0], color='#e41a1c', ls='--', lw=0.8, label='p = 0.05')],
+              fontsize=5.5, frameon=False, ncol=2,
+              title='Tier / Clone size', title_fontsize=5.5)
+    ax.set_title('A  Clone-consistent mutation calls', loc='left', fontsize=7, fontweight='bold')
+
+    ax = axes[1]
+    ax.axis('off')
+    top = (clone_mut[clone_mut['is_clone_mutated']]
+           .sort_values('p_fisher' if 'p_fisher' in clone_mut.columns else 'p_clone_noise')
+           .head(15)
+           [['clone_group', 'ins_key', 'delta_length', 'n_clone_cells',
+             'n_clone_calling', 'p_clone_noise', 'confidence_tier']]
+           .copy())
+    top['p_clone_noise'] = top['p_clone_noise'].map('{:.2e}'.format)
+    top['clone_group'] = top['clone_group'].astype(int)
+    top.columns = ['Clone\nID', 'Insertion', 'Δ', 'Clone\nsize', 'Calling', 'p_clone', 'Tier']
+    tbl = ax.table(cellText=top.values, colLabels=top.columns, cellLoc='center', loc='center')
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(5.0)
+    tbl.scale(1, 1.25)
+    ax.set_title('B  Top clone-consistent events', loc='left', fontsize=7, fontweight='bold')
+    fig.tight_layout(pad=0.8)
+    _savefig(fig, os.path.join(out_dir, 'figures', 'fig5_clone_mutations.pdf'))
+
+
+def fig_fpr_calibration(breakdown, calibrated_fpr, summary, out_dir):
+    fig, axes = plt.subplots(1, 2, figsize=(7, 3))
+    ax = axes[0]
+    buckets = list(calibrated_fpr.keys())
+    ax.bar(buckets, [calibrated_fpr[b] for b in buckets],
+           color=[BUCKET_COLORS.get(b, '#aaa') for b in buckets],
+           edgecolor='#333', linewidth=0.4)
+    ax.axhline(0.05, color='#333', ls='--', lw=0.7, label='5% reference')
+    ax.set_ylabel('Calibrated per-cell FPR (p_noise)')
+    ax.set_xlabel('Δ length bucket')
+    ax.legend(fontsize=6, frameon=False)
+    ax.set_title('A  Calibrated FPR by bucket', loc='left', fontsize=7, fontweight='bold')
+
+    ax = axes[1]
+    ax.axis('off')
+    disp = summary[['n_candidates', 'n_is_mutated', 'n_clone_size_ge2',
+                     'n_all_agree', 'frac_all_agree']].copy()
+    disp['frac_all_agree'] = disp['frac_all_agree'].map('{:.3f}'.format)
+    disp.columns = ['Cands', 'is_mut', 'Clone≥2', 'All-agree', 'Frac-agree']
+    tbl = ax.table(cellText=disp.values, rowLabels=disp.index,
+                   colLabels=disp.columns, cellLoc='center', loc='center')
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(6)
+    tbl.scale(1, 1.3)
+    ax.set_title('B  Clone consistency summary', loc='left', fontsize=7, fontweight='bold')
+    fig.tight_layout(pad=0.8)
+    _savefig(fig, os.path.join(out_dir, 'figures', 'ed4_fpr_calibration.pdf'))
