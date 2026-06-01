@@ -1047,6 +1047,75 @@ def clone_size_breakdown(annotated, min_clone_cells=2):
     return breakdown
 
 
+def flag_germline_alleles(clone_mut, histogram_dfs, max_pop_af=0.005,
+                          insertion_info=None, max_seq_minor_af=0.05):
+    """
+    For every clone-consistent mutation (is_clone_mutated=True), apply two filters:
+
+    1. Population length AF: compute the fraction of ALL cells whose per-cell
+       hist_peak mode equals the called cell_length. Flag if > max_pop_af.
+
+    2. Unphased sequence polymorphism (requires insertion_info DataFrame with
+       allele_fractions column): for unphased calls (a_key=0, t_key=0), flag if
+       the insertion site has a second sequence allele at > max_seq_minor_af in
+       the population. Such loci have an unresolved germline length difference
+       that can masquerade as a somatic mutation.
+    """
+    if clone_mut.empty:
+        return clone_mut.assign(pop_af=np.nan, seq_minor_af=np.nan)
+
+    out = clone_mut.copy()
+    out['pop_af']      = np.nan
+    out['seq_minor_af'] = np.nan
+
+    hit_mask = out.get('is_clone_mutated', pd.Series(False, index=out.index))
+    hit_idx  = out.index[hit_mask]
+    if len(hit_idx) == 0:
+        return out
+
+    # Build minor sequence AF lookup if insertion_info provided
+    seq_minor_af_map = {}
+    if insertion_info is not None and 'allele_fractions' in insertion_info.columns:
+        def _minor(s):
+            if pd.isna(s):
+                return 0.0
+            parts = [float(x) for x in str(s).split(';') if x.strip()]
+            return sorted(parts)[-2] if len(parts) >= 2 else 0.0
+        seq_minor_af_map = insertion_info['allele_fractions'].apply(_minor).to_dict()
+
+    for i in hit_idx:
+        row      = out.loc[i]
+        ins_key  = int(row['ins_key'])
+        a_key    = int(row['a_key'])
+        t_key    = int(row['t_key'])
+        cell_len = int(row['cell_length'])
+
+        # Check 1: population length AF
+        if ins_key in histogram_dfs:
+            h    = histogram_dfs[ins_key]
+            idx  = h.index
+            mask = (idx.get_level_values(2) == a_key) & (idx.get_level_values(3) == t_key)
+            if mask.any():
+                peaks      = h.loc[mask, 'hist_peak']
+                cell_peaks = peaks.groupby(level=0).agg(
+                    lambda x: x.mode().iloc[0] if len(x.dropna()) > 0 else np.nan)
+                n_total = int(cell_peaks.notna().sum())
+                n_match = int((cell_peaks == cell_len).sum())
+                if n_total > 0:
+                    out.at[i, 'pop_af'] = n_match / n_total
+
+        # Check 2: unphased call at a locus with common second sequence allele
+        if a_key == 0 and t_key == 0 and ins_key in seq_minor_af_map:
+            out.at[i, 'seq_minor_af'] = seq_minor_af_map[ins_key]
+
+    flagged = (
+        (out['pop_af'].notna()       & (out['pop_af']       > max_pop_af)) |
+        (out['seq_minor_af'].notna() & (out['seq_minor_af'] > max_seq_minor_af))
+    )
+    out.loc[flagged, 'is_clone_mutated'] = False
+    return out
+
+
 def fit_calibrated_fpr(breakdown):
     """Fit per-cell noise FPR via log-linear regression on clone-size data."""
     from scipy import stats as _st

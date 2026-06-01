@@ -79,6 +79,7 @@ from polyA_functions import (
     annotate_clone_consistency,
     summarise_clone_consistency,
     add_clone_pvalue,
+    flag_germline_alleles,
     clone_size_breakdown,
     fit_calibrated_fpr,
     fig_noise_model,
@@ -333,25 +334,12 @@ def run_regression(ts, metrics, n_clust=None, ts_cells=None, noise_fn_name='OLS'
 
 # ── Pre-analysis insertion filter ─────────────────────────────────────────────
 
-def build_insertion_blacklist(insertion_info_path, max_minor_af, canon_chroms_re):
-    import re
+def build_insertion_blacklist(insertion_info_path, canon_chroms_re):
     ins = pd.read_csv(insertion_info_path, index_col=0)
     blacklist = set()
-
     if 'chrom' in ins.columns:
         bad_chrom = ins[~ins['chrom'].astype(str).str.match(canon_chroms_re)].index
         blacklist.update(bad_chrom.tolist())
-
-    if 'allele_fractions' in ins.columns:
-        def _minor_af(s):
-            if pd.isna(s):
-                return 0.0
-            parts = [float(x) for x in str(s).split(';') if x.strip()]
-            return sorted(parts)[-2] if len(parts) >= 2 else 0.0
-        minor_af = ins['allele_fractions'].apply(_minor_af)
-        bad_af = minor_af[minor_af > max_minor_af].index
-        blacklist.update(bad_af.tolist())
-
     return blacklist
 
 
@@ -380,14 +368,21 @@ def main():
     parser.add_argument('--output-dir', default=None,
                         help='Output directory (default: auto-timestamped)')
     parser.add_argument('--insertion-info', default=None,
-                        help='Insertion summary CSV (index=ins_key, columns include '
-                             'chrom, allele_fractions). When provided, insertions on '
-                             'non-canonical chromosomes or with a population minor-allele '
-                             'frequency above --max-minor-af are excluded before analysis.')
-    parser.add_argument('--max-minor-af', type=float, default=0.05,
-                        help='Max population minor-allele frequency for inclusion '
-                             '(default: 0.05). Insertions with a second allele at higher '
-                             'frequency are treated as germline polymorphisms and excluded.')
+                        help='Insertion summary CSV (index=ins_key, column chrom required). '
+                             'When provided, insertions on non-canonical chromosomes '
+                             '(unplaced scaffolds, alt contigs) are excluded before analysis.')
+    parser.add_argument('--max-pop-af', type=float, default=0.005,
+                        help='Max population allele frequency for clone-consistent mutations '
+                             '(default: 0.005 = 0.5%%). After calling mutations, any '
+                             'clone-consistent call where the mutant length is present in '
+                             'more than this fraction of ALL cells is flagged as likely '
+                             'germline and excluded.')
+    parser.add_argument('--max-seq-minor-af', type=float, default=0.05,
+                        help='Max sequence minor-allele frequency for unphased clone '
+                             'mutations (default: 0.05). Requires --insertion-info. '
+                             'Unphased calls (a_key=0) at loci where a second sequence '
+                             'allele exceeds this population frequency are flagged as '
+                             'potentially germline.')
     parser.add_argument('--canon-chroms', default=r'^chr[0-9XYM]+$',
                         help='Regex matching canonical chromosome names to KEEP '
                              '(default: "^chr[0-9XYM]+$"). Insertions on non-matching '
@@ -452,9 +447,10 @@ def main():
     print(f'  sample map         : {"loaded ({:,} cells)".format(len(sample_map))   if have_sample else "not provided — per-sample analysis skipped"}')
 
     # ── Pre-analysis insertion filter ─────────────────────────────────────────
+    insertion_info_df = None
     if args.insertion_info:
-        blacklist = build_insertion_blacklist(
-            args.insertion_info, args.max_minor_af, args.canon_chroms)
+        insertion_info_df = pd.read_csv(args.insertion_info, index_col=0)
+        blacklist = build_insertion_blacklist(args.insertion_info, args.canon_chroms)
         n_total = len(histogram_dfs)
         for d in [histogram_dfs, allele_calls,
                   peak_based, phase_allele_snv, phase_biallele_snv]:
@@ -462,7 +458,7 @@ def main():
                 for k in blacklist:
                     d.pop(k, None)
         print(f'  Pre-filter: excluded {len(blacklist)} of {n_total} insertions '
-              f'(chrom or minor-AF > {args.max_minor_af})')
+              f'(non-canonical chromosome)')
 
     # ── Core pipeline ─────────────────────────────────────────────────────────
     print(f'\nBuilding noise model (n_jobs={n_jobs}) ...')
@@ -517,6 +513,12 @@ def main():
         print('Summarising clone consistency ...')
         summary, clone_mut = summarise_clone_consistency(annotated, min_clone_size=2)
         clone_mut = add_clone_pvalue(clone_mut, annotated, tested_cells)
+        clone_mut = flag_germline_alleles(
+            clone_mut, histogram_dfs,
+            max_pop_af=args.max_pop_af,
+            insertion_info=insertion_info_df,
+            max_seq_minor_af=args.max_seq_minor_af,
+        )
 
         print('\n=== Clone consistency summary ===')
         print(summary.to_string())
